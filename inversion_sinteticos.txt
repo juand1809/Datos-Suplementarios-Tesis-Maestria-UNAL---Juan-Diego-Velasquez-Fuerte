@@ -1,0 +1,621 @@
+# ====== Funciones – Inversión sintética (gravity | mag_gradiometry | joint) ======
+# Requisitos: discretize, SimPEG, numpy, pandas, matplotlib, scipy
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib import cm, colors
+from discretize import TensorMesh
+from discretize.utils import active_from_xyz
+from scipy.spatial import cKDTree
+from simpeg import maps, data, data_misfit, regularization, optimization, directives, inverse_problem, inversion
+from simpeg.potential_fields import gravity, magnetics
+
+# ---------------- Malla plana con celdas activas bajo z_top ----------------
+
+def _flat_topo_xyz(xmin, xmax, ymin, ymax, z_top, nx=25, ny=25):
+    xs = np.linspace(xmin, xmax, nx)
+    ys = np.linspace(ymin, ymax, ny)
+    X, Y = np.meshgrid(xs, ys, indexing="xy")
+    Z = np.full_like(X, float(z_top))
+    return np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
+
+def build_mesh_and_active_flat(xyz, dh=150., nz=40, z_top=None, pad=0.0, strip_top_layers=0):
+    x0, x1 = float(xyz[:,0].min()) - pad, float(xyz[:,0].max()) + pad
+    y0, y1 = float(xyz[:,1].min()) - pad, float(xyz[:,1].max()) + pad
+    if z_top is None:
+        z_top = float(np.nanmax(xyz[:,2])) + 0.5*dh
+    nx = int(np.ceil((x1-x0)/dh))
+    ny = int(np.ceil((y1-y0)/dh))
+    z0 = z_top - dh*nz
+
+    mesh = TensorMesh([[dh]*nx, [dh]*ny, [dh]*nz], x0=[x0, y0, z0])
+    topo_xyz = _flat_topo_xyz(x0, x1, y0, y1, z_top)
+    active = active_from_xyz(mesh, topo_xyz)
+
+    if strip_top_layers and strip_top_layers > 0:
+        CC = mesh.gridCC
+        h_z_min = float(np.min(np.atleast_1d(mesh.h[2])))
+        z_thresh = np.max(mesh.cell_centers_z) - strip_top_layers * h_z_min
+        active = active & (CC[:,2] < z_thresh)
+    return mesh, active, topo_xyz
+
+# ---------------- Utilidades de cortes/colores ----------------
+
+def _select_auto_slices(mesh, active, ref_vec, bg=None):
+    shape = mesh.shape_cells
+    vol = np.full(shape, np.nan, order="F")
+    act_idx = np.where(active)[0]
+    act_idx3 = np.unravel_index(act_idx, shape, order="F")
+    vol[act_idx3] = ref_vec
+    if bg is not None:
+        vol = np.abs(vol - bg)
+    z_idx = int(np.nanargmax(np.nanmean(vol, axis=(0,1))))
+    y_idx = int(np.nanargmax(np.nanmean(vol, axis=(0,2))))
+    zs = mesh.cell_centers_z
+    return (z_idx, y_idx, float(np.max(zs)), float(np.min(zs)))
+
+def _robust_limits(arr, low=2, high=98, pad=0.05):
+    a = np.asarray(arr); a = a[np.isfinite(a)]
+    if a.size == 0: return 0.0, 1.0
+    lo, hi = np.percentile(a, [low, high])
+    span = hi - lo if hi > lo else max(abs(hi), 1.0)
+    return float(lo - pad*span), float(hi + pad*span)
+
+# ---------------- Plots 2D (con fix de “barra blanca” en vertical) ----------------
+
+def _plot_density_results(
+    mesh, active, m0, rho_rec, topo_xyz, xyz, bg_val,
+    fixed_slices=None, slice_source="recovered"
+):
+    xs, ys, zs = mesh.cell_centers_x, mesh.cell_centers_y, mesh.cell_centers_z
+    shape = mesh.shape_cells
+
+    dens0_3D = np.full(shape, np.nan, order="F")
+    densR_3D = np.full(shape, np.nan, order="F")
+    act_idx = np.where(active)[0]
+    act_idx3 = np.unravel_index(act_idx, shape, order="F")
+    dens0_3D[act_idx3] = m0
+    densR_3D[act_idx3] = rho_rec
+
+    if fixed_slices is None:
+        base = rho_rec if slice_source.lower().startswith("rec") else m0
+        z_idx, y_idx, depth_top, depth_bottom = _select_auto_slices(mesh, active, base, bg=bg_val)
+    else:
+        z_idx, y_idx, depth_top, depth_bottom = fixed_slices
+
+    zlev, ylev = zs[z_idx], ys[y_idx]
+    z_mask = (zs >= depth_bottom) & (zs <= depth_top)
+
+    vmin0, vmax0 = _robust_limits(dens0_3D[np.isfinite(dens0_3D)])
+
+    fig = plt.figure(figsize=(16, 18))
+    gs = fig.add_gridspec(3, 2)
+
+    # Horizontales
+    ax1 = fig.add_subplot(gs[0, 0])
+    im1 = ax1.imshow(dens0_3D[:, :, z_idx].T,
+                     extent=[xs.min(), xs.max(), ys.min(), ys.max()],
+                     origin="lower", cmap="viridis", vmin=vmin0, vmax=vmax0)
+    ax1.set_title(f"Corte Horizontal @ Z = {zlev:.1f} m (Inicial)")
+    plt.colorbar(im1, ax=ax1, label="Densidad (g/cc)")
+    ax1.scatter(xyz[:,0], xyz[:,1], c="white", s=14, alpha=0.7, edgecolor="k", linewidth=0.3, label="Estaciones")
+    ax1.legend()
+
+    ax2 = fig.add_subplot(gs[0, 1])
+    im2 = ax2.imshow(densR_3D[:, :, z_idx].T,
+                     extent=[xs.min(), xs.max(), ys.min(), ys.max()],
+                     origin="lower", cmap="viridis", vmin=vmin0, vmax=vmax0)
+    ax2.set_title(f"Corte Horizontal @ Z = {zlev:.1f} m (Recuperado)")
+    plt.colorbar(im2, ax=ax2, label="Densidad (g/cc)")
+
+    # Verticales (recorte de filas todo-NaN y ajuste de extent)
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax4 = fig.add_subplot(gs[1, 1])
+
+    sl0 = dens0_3D[:, y_idx, :].T[z_mask, :]
+    slR = densR_3D[:, y_idx, :].T[z_mask, :]
+    z_sel = zs[z_mask]
+    row_valid = (np.any(np.isfinite(sl0), axis=1) | np.any(np.isfinite(slR), axis=1))
+    if not np.any(row_valid):
+        row_valid = np.ones(sl0.shape[0], dtype=bool)
+    sl0 = sl0[row_valid, :]; slR = slR[row_valid, :]; z_sel = z_sel[row_valid]
+    z_bot, z_top_plot = float(z_sel.min()), float(z_sel.max())
+
+    im3 = ax3.imshow(sl0, extent=[xs.min(), xs.max(), z_bot, z_top_plot],
+                     origin="lower", cmap="viridis", aspect="auto",
+                     interpolation="nearest", vmin=vmin0, vmax=vmax0)
+    ax3.set_title(f"Corte Vertical @ Y = {ylev:.1f} m (Inicial)")
+    plt.colorbar(im3, ax=ax3, label="Densidad (g/cc)")
+
+    im4 = ax4.imshow(slR, extent=[xs.min(), xs.max(), z_bot, z_top_plot],
+                     origin="lower", cmap="viridis", aspect="auto",
+                     interpolation="nearest", vmin=vmin0, vmax=vmax0)
+    ax4.set_title(f"Corte Vertical @ Y = {ylev:.1f} m (Recuperado)")
+    plt.colorbar(im4, ax=ax4, label="Densidad (g/cc)")
+
+    plt.tight_layout(); plt.show()
+    return (z_idx, y_idx, depth_top, depth_bottom)
+
+def _plot_scalar_results(
+    mesh, active, m0, mrec, topo_xyz=None, label="Propiedad",
+    fixed_slices=None, bg=None, slice_source="recovered",
+    as_anomaly=False, anomaly_ref=0.0
+):
+    xs, ys, zs = mesh.cell_centers_x, mesh.cell_centers_y, mesh.cell_centers_z
+    shape = mesh.shape_cells
+
+    m0_3D = np.full(shape, np.nan, order="F")
+    mr_3D = np.full(shape, np.nan, order="F")
+    act_idx = np.where(active)[0]
+    act_idx3 = np.unravel_index(act_idx, shape, order="F")
+    m0_3D[act_idx3] = m0
+    mr_3D[act_idx3] = mrec
+
+    if fixed_slices is None:
+        ref = mrec if slice_source.lower().startswith("rec") else m0
+        z_idx, y_idx, depth_top, depth_bottom = _select_auto_slices(mesh, active, ref, bg=bg)
+    else:
+        z_idx, y_idx, depth_top, depth_bottom = fixed_slices
+
+    zlev, ylev = zs[z_idx], ys[y_idx]
+    z_mask = (zs >= depth_bottom) & (zs <= depth_top)
+
+    if as_anomaly:
+        panel = mr_3D - float(anomaly_ref)
+        vA = float(np.nanpercentile(np.abs(panel), 98)) or 1.0
+        cmap_h = "RdBu_r"; norm = colors.TwoSlopeNorm(vmin=-vA, vcenter=0.0, vmax=+vA)
+        vmin0, vmax0 = None, None
+    else:
+        vmin0, vmax0 = _robust_limits(np.nan_to_num(m0, nan=0.0))
+        cmap_h = "viridis"; norm = None
+        panel = mr_3D
+
+    fig = plt.figure(figsize=(16, 18)); gs = fig.add_gridspec(2, 2)
+
+    ax1 = fig.add_subplot(gs[0, 0])
+    im1 = ax1.imshow(m0_3D[:, :, z_idx].T, extent=[xs.min(), xs.max(), ys.min(), ys.max()],
+                     origin="lower", cmap="viridis", vmin=vmin0, vmax=vmax0)
+    ax1.set_title(f"Corte Horizontal @ Z = {zlev:.1f} m (Inicial)")
+    plt.colorbar(im1, ax=ax1, label=label)
+
+    ax2 = fig.add_subplot(gs[0, 1])
+    im2 = ax2.imshow(panel[:, :, z_idx].T, extent=[xs.min(), xs.max(), ys.min(), ys.max()],
+                     origin="lower", cmap=cmap_h, vmin=vmin0, vmax=vmax0, norm=norm)
+    ax2.set_title(f"Corte Horizontal @ Z = {zlev:.1f} m (Recuperado{' – Anom.' if as_anomaly else ''})")
+    plt.colorbar(im2, ax=ax2, label=(label if not as_anomaly else f"{label} - ref"))
+
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax4 = fig.add_subplot(gs[1, 1])
+
+    sl0 = m0_3D[:, y_idx, :].T[z_mask, :]
+    slR = panel[:, y_idx, :].T[z_mask, :]
+    z_sel = zs[z_mask]
+    row_valid = (np.any(np.isfinite(sl0), axis=1) | np.any(np.isfinite(slR), axis=1))
+    if not np.any(row_valid):
+        row_valid = np.ones(sl0.shape[0], dtype=bool)
+    sl0 = sl0[row_valid, :]; slR = slR[row_valid, :]; z_sel = z_sel[row_valid]
+    z_bot, z_top_plot = float(z_sel.min()), float(z_sel.max())
+
+    im3 = ax3.imshow(sl0, extent=[xs.min(), xs.max(), z_bot, z_top_plot],
+                     origin="lower", cmap="viridis", aspect="auto",
+                     interpolation="nearest", vmin=vmin0, vmax=vmax0)
+    ax3.set_title(f"Corte Vertical @ Y = {ylev:.1f} m (Inicial)")
+    plt.colorbar(im3, ax=ax3, label=label)
+
+    im4 = ax4.imshow(slR, extent=[xs.min(), xs.max(), z_bot, z_top_plot],
+                     origin="lower", cmap=(cmap_h if as_anomaly else "viridis"),
+                     aspect="auto", interpolation="nearest",
+                     vmin=(None if as_anomaly else vmin0),
+                     vmax=(None if as_anomaly else vmax0),
+                     norm=(norm if as_anomaly else None))
+    ax4.set_title(f"Corte Vertical @ Y = {ylev:.1f} m (Recuperado{' – Anom.' if as_anomaly else ''})")
+    plt.colorbar(im4, ax=ax4, label=(label if not as_anomaly else f"{label} - ref"))
+
+    plt.tight_layout(); plt.show()
+    return (z_idx, y_idx, depth_top, depth_bottom)
+
+# ---------------- Plot 3D (misma escala en ambos paneles + “pelado” opcional) ----------------
+
+def _plot_model_3d(
+    mesh, active, m_init, m_rec, label,
+    vmin=None, vmax=None, alpha=1.0, stride=(1,1,1),
+    plot_strip_top_layers=0
+):
+    shape = mesh.shape_cells
+    m0_3D = np.full(shape, np.nan, order="F")
+    mr_3D = np.full(shape, np.nan, order="F")
+    act_idx = np.where(active)[0]
+    i3d = np.unravel_index(act_idx, shape, order="F")
+    m0_3D[i3d] = m_init
+    mr_3D[i3d] = m_rec
+
+    sx, sy, sz = stride
+    m0_3D = m0_3D[::sx, ::sy, ::sz]
+    mr_3D = mr_3D[::sx, ::sy, ::sz]
+
+    xe = mesh.nodes_x[::sx]; ye = mesh.nodes_y[::sy]; ze = mesh.nodes_z[::sz]
+    if len(xe) != m0_3D.shape[0] + 1: xe = np.r_[xe, mesh.nodes_x[-1]]
+    if len(ye) != m0_3D.shape[1] + 1: ye = np.r_[ye, mesh.nodes_y[-1]]
+    if len(ze) != m0_3D.shape[2] + 1: ze = np.r_[ze, mesh.nodes_z[-1]]
+    X, Y, Z = np.meshgrid(xe, ye, ze, indexing="ij")
+
+    if (vmin is None) or (vmax is None):
+        vmin_g = float(min(np.nanmin(m_init), np.nanmin(m_rec)))
+        vmax_g = float(max(np.nanmax(m_init), np.nanmax(m_rec)))
+    else:
+        vmin_g, vmax_g = float(vmin), float(vmax)
+    if not (vmax_g > vmin_g):
+        eps = 1e-9 if vmin_g == 0.0 else 1e-6*abs(vmin_g) + 1e-9
+        vmin_g -= eps; vmax_g += eps
+
+    cmap = cm.get_cmap("viridis")
+    norm = colors.Normalize(vmin=vmin_g, vmax=vmax_g)
+
+    f0 = ~np.isnan(m0_3D); c0 = cmap(norm(np.where(f0, m0_3D, np.nan))); c0[..., 3] = np.where(f0, float(alpha), 0.0)
+    fR = ~np.isnan(mr_3D); cR = cmap(norm(np.where(fR, mr_3D, np.nan))); cR[..., 3] = np.where(fR, float(alpha), 0.0)
+
+    if plot_strip_top_layers and plot_strip_top_layers > 0:
+        k = max(0, int(plot_strip_top_layers))
+        k = min(k, f0.shape[2])
+        if k > 0:
+            f0[:, :, -k:] = False
+            fR[:, :, -k:] = False
+
+    sm = cm.ScalarMappable(norm=norm, cmap=cmap); sm.set_array([])
+
+    fig = plt.figure(figsize=(14, 6))
+    ax1 = fig.add_subplot(121, projection="3d"); ax1.voxels(X, Y, Z, f0, facecolors=c0, edgecolor="none")
+    ax1.set_title(f"Inicial – {label}"); ax1.set_xlabel("X"); ax1.set_ylabel("Y"); ax1.set_zlabel("Z")
+    fig.colorbar(sm, ax=ax1, fraction=0.046, pad=0.04, label=label)
+
+    ax2 = fig.add_subplot(122, projection="3d"); ax2.voxels(X, Y, Z, fR, facecolors=cR, edgecolor="none")
+    ax2.set_title(f"Recuperado – {label}"); ax2.set_xlabel("X"); ax2.set_ylabel("Y"); ax2.set_zlabel("Z")
+    fig.colorbar(sm, ax=ax2, fraction=0.046, pad=0.04, label=label)
+    plt.tight_layout(); plt.show()
+
+# ---------------- Núcleo de inversión ----------------
+
+def invert_synth_with_options(
+    data_csv,
+    dh=150., nz=40, z_top=None, pad=0.0, strip_top_layers=0,
+    inv_type="joint",                   # "gravity" | "mag_gradiometry" | "joint"
+    B0=30055.6, inc=26.78927, dec=-7.63654,
+    prefer_bzz=True, alpha_z_chi=5e-3,
+    fixed_slices=None,
+    rho_background=2.5,
+    # SOLO VISUAL:
+    stride_3d=(1,1,1), plot_strip_top_layers=0,
+    # PREVIO opcional:
+    use_prior=False, prior_model_file=None
+):
+    df = pd.read_csv(data_csv)
+    if not {"X","Y","Z"}.issubset(df.columns):
+        raise KeyError(f"{data_csv} debe contener columnas X,Y,Z.")
+    xyz_all = df[["X","Y","Z"]].astype(float).values
+
+    # Señales presentes
+    has_g = "gravedad" in df.columns
+    if has_g: gz_obs = df["gravedad"].astype(float).values
+
+    candidates = ["bzz","byy","bxx","bxy","bxz","byz"]
+    have = [c for c in candidates if c in df.columns]
+    components = ([c for c in ["bzz","byy","bxx"] if c in have] or have) if prefer_bzz else have
+    has_m = len(components) > 0
+    if has_m:
+        M = np.column_stack([df[c].astype(float).values for c in components])
+        dobs_m = M.ravel(order="C")
+
+    # Malla
+    mesh, active, topo_xyz = build_mesh_and_active_flat(
+        xyz_all, dh=dh, nz=nz, z_top=z_top, pad=pad, strip_top_layers=strip_top_layers
+    )
+    nA = int(active.sum()); CC_act = mesh.gridCC[active]
+
+    # Modelos iniciales
+    bg = float(rho_background)
+    m0rho = np.full(nA, bg, dtype=float)
+    m0chi = np.zeros(nA, dtype=float) + 0.01
+
+    # Cargar previo (opcional)
+    if use_prior and prior_model_file and os.path.isfile(prior_model_file):
+        try:
+            dprev = pd.read_csv(prior_model_file)
+            P = dprev[["X","Y","Z"]].astype(float).values
+            ids = cKDTree(P).query(CC_act, k=1)[1]
+            cols_low = [c.strip().lower() for c in dprev.columns]
+            for key in ["densidad","density","rho","dens"]:
+                if key in cols_low:
+                    m0rho = pd.to_numeric(dprev[dprev.columns[cols_low.index(key)]], errors="coerce").values[ids].astype(float)
+                    break
+            for key in ["susceptibilidad","susceptibility","chi","k","kappa"]:
+                if key in cols_low:
+                    m0chi = pd.to_numeric(dprev[dprev.columns[cols_low.index(key)]], errors="coerce").values[ids].astype(float)
+                    break
+        except Exception as e:
+            print("[warn] no se pudo cargar el previo:", e)
+
+    out = {"mesh": mesh, "active": active, "topo_xyz": topo_xyz,
+           "rho_init": m0rho, "chi_init": m0chi,
+           "rho_rec": None, "chi_rec": None, "xyz_all": xyz_all}
+
+    # Errores
+    if has_g:
+        errs_g = np.maximum(1e-3, 0.02*np.abs(gz_obs))
+    if has_m:
+        NOISE_M_FRAC = 0.03
+        abs_cols = [np.abs(df[c].values.astype(float)) for c in components]
+        p90_each = [np.percentile(a, 90) for a in abs_cols]
+        floors   = [0.05*v if v>0 else 1e-9 for v in p90_each]
+        std_cols = [np.maximum(floor_i, NOISE_M_FRAC*a)
+                    for a, floor_i in zip(abs_cols, floors)]
+        std_block = np.column_stack(std_cols).ravel(order="C")
+
+    # Normaliza tipo
+    it = str(inv_type).strip().lower()
+    alias = {"grav":"gravity","gz":"gravity","mag":"mag_gradiometry"}
+    inv_type_l = alias.get(it, it)
+    if inv_type_l not in {"gravity","mag_gradiometry","joint"}:
+        inv_type_l = "joint" if (has_g and has_m) else ("gravity" if has_g else "mag_gradiometry")
+
+    # ---------------- GRAVITY ----------------
+    if inv_type_l == "gravity":
+        if not has_g: raise ValueError("No hay 'gravedad' en el CSV.")
+        wires = maps.Wires(("density", nA))
+        rx_g  = gravity.receivers.Point(xyz_all, components="gz")
+        src_g = gravity.sources.SourceField([rx_g])
+        survey_g = gravity.survey.Survey(src_g)
+        sim_g = gravity.simulation.Simulation3DIntegral(
+            mesh=mesh, rhoMap=wires.density, survey=survey_g,
+            active_cells=active, store_sensitivities="disk"
+        )
+        dobj_g = data.Data(survey_g, dobs=gz_obs, standard_deviation=errs_g)
+        dmis_g = data_misfit.L2DataMisfit(data=dobj_g, simulation=sim_g)
+
+        m_ref   = np.zeros_like(m0rho)   # sin “pull” al previo
+        m_start = np.zeros_like(m0rho)
+
+        reg_g = regularization.WeightedLeastSquares(
+            mesh, active_cells=active, mapping=wires.density,
+            alpha_s=5e-4, alpha_x=5e-4, alpha_y=5e-4, alpha_z=5e-4,
+            reference_model=m_ref
+        )
+        opt = optimization.ProjectedGNCG(maxIter=40, lower=-bg, upper=5.0 - bg)
+        dirs = [
+            directives.UpdateSensitivityWeights(),
+            directives.BetaEstimate_ByEig(beta0_ratio=0.5),
+            directives.BetaSchedule(coolingFactor=3, coolingRate=1.0),
+            directives.Update_IRLS(max_irls_iterations=20, f_min_change=1e-4),
+        ]
+        invp = inverse_problem.BaseInvProblem(dmis_g, reg_g, opt)
+        inv  = inversion.BaseInversion(invp, directiveList=dirs)
+        mrec = inv.run(m_start)
+        rho_rec = mrec + bg
+        out["rho_rec"] = rho_rec
+
+        # 2D
+        cuts = fixed_slices if (fixed_slices is not None) else _select_auto_slices(mesh, active, rho_rec, bg=rho_background)
+        _ = _plot_density_results(mesh, active, m0rho, rho_rec, topo_xyz, xyz_all, bg_val=rho_background,
+                                  fixed_slices=cuts, slice_source="recovered")
+
+        # 3D (escala desde el previo)
+        vmin_d = float(np.nanmin(m0rho)); vmax_d = float(np.nanmax(m0rho))
+        if not (vmax_d > vmin_d):
+            eps = 1e-9 if vmin_d == 0.0 else 1e-6*abs(vmin_d) + 1e-9
+            vmin_d -= eps; vmax_d += eps
+        _plot_model_3d(mesh, active, m0rho, rho_rec, "Densidad (g/cc)",
+                       vmin=vmin_d, vmax=vmax_d, alpha=1.0,
+                       stride=stride_3d, plot_strip_top_layers=plot_strip_top_layers)
+        return out
+
+    # ---------------- MAG_GRADIOMETRY ----------------
+    if inv_type_l == "mag_gradiometry":
+        if not has_m: raise ValueError("No hay columnas de gradientes magnéticos en el CSV.")
+        receiver_list = [magnetics.receivers.Point(xyz_all, components=components)]
+        source_field  = magnetics.sources.UniformBackgroundField(
+            receiver_list=receiver_list, amplitude=B0, inclination=inc, declination=dec
+        )
+        survey_m = magnetics.survey.Survey(source_field)
+        sim_m = magnetics.simulation.Simulation3DIntegral(
+            mesh=mesh, chiMap=maps.IdentityMap(nP=nA),
+            survey=survey_m, active_cells=active, store_sensitivities="disk"
+        )
+        dobj_m = data.Data(survey_m, dobs=dobs_m, standard_deviation=std_block)
+        dmis_m = data_misfit.L2DataMisfit(data=dobj_m, simulation=sim_m)
+        reg_m  = regularization.WeightedLeastSquares(
+            mesh, active_cells=active, mapping=maps.IdentityMap(nP=nA),
+            alpha_s=1e-3, alpha_x=1e-3, alpha_y=1e-3, alpha_z=float(alpha_z_chi),
+            reference_model=m0chi
+        )
+        lower = np.zeros(nA) + 0.0
+        upper = np.zeros(nA) + 2.0
+        opt = optimization.ProjectedGNCG(maxIter=40, lower=lower, upper=upper)
+        dirs = [
+            directives.UpdateSensitivityWeights(),
+            directives.BetaEstimate_ByEig(beta0_ratio=0.5),
+            directives.BetaSchedule(coolingFactor=3, coolingRate=1.0),
+            directives.Update_IRLS(max_irls_iterations=20, f_min_change=1e-4),
+        ]
+        invp = inverse_problem.BaseInvProblem(dmis_m, reg_m, opt)
+        inv  = inversion.BaseInversion(invp, directiveList=dirs)
+        chi_rec = inv.run(m0chi)
+        out["chi_rec"] = chi_rec
+
+        # 2D
+        cuts_chi = fixed_slices if (fixed_slices is not None) else _select_auto_slices(mesh, active, m0chi, bg=0.0)
+        _ = _plot_scalar_results(mesh, active, m0chi, chi_rec, label="Susceptibilidad (SI)",
+                                 fixed_slices=cuts_chi, bg=0.0, slice_source="recovered")
+
+        # 3D (escala desde el previo)
+        vmin_k = float(np.nanmin(m0chi)); vmax_k = float(np.nanmax(m0chi))
+        if not (vmax_k > vmin_k):
+            eps = 1e-9 if vmin_k == 0.0 else 1e-6*abs(vmin_k) + 1e-9
+            vmin_k -= eps; vmax_k += eps
+        _plot_model_3d(mesh, active, m0chi, chi_rec, "Susceptibilidad (SI)",
+                       vmin=vmin_k, vmax=vmax_k, alpha=1.0,
+                       stride=stride_3d, plot_strip_top_layers=plot_strip_top_layers)
+        return out
+
+    # ---------------- JOINT ----------------
+    if not (has_g and has_m):
+        raise ValueError("Para 'joint' se requieren 'gravedad' y gradientes magnéticos.")
+
+    wires = maps.Wires(("density", nA), ("chi", nA))
+
+    # Gravity
+    rx_g   = gravity.receivers.Point(xyz_all, components="gz")
+    src_g  = gravity.sources.SourceField([rx_g])
+    survey_g = gravity.survey.Survey(src_g)
+    sim_g  = gravity.simulation.Simulation3DIntegral(
+        mesh=mesh, rhoMap=wires.density, survey=survey_g,
+        active_cells=active, store_sensitivities="disk"
+    )
+    dobj_g = data.Data(survey_g, dobs=gz_obs, standard_deviation=errs_g)
+    dmis_g = data_misfit.L2DataMisfit(data=dobj_g, simulation=sim_g)
+
+    # Magnetics
+    receiver_list = [magnetics.receivers.Point(xyz_all, components=components)]
+    source_field  = magnetics.sources.UniformBackgroundField(
+        receiver_list=receiver_list, amplitude=B0, inclination=inc, declination=dec
+    )
+    survey_m = magnetics.survey.Survey(source_field)
+    sim_m  = magnetics.simulation.Simulation3DIntegral(
+        mesh=mesh, chiMap=wires.chi, survey=survey_m,
+        active_cells=active, store_sensitivities="disk"
+    )
+    dobj_m = data.Data(survey_m, dobs=dobs_m, standard_deviation=std_block)
+    dmis_m = data_misfit.L2DataMisfit(data=dobj_m, simulation=sim_m)
+
+    dmis = dmis_g + dmis_m
+
+    mref_joint   = np.r_[np.zeros_like(m0rho), m0chi*0.0]  # sin pull
+    mstart_joint = np.r_[np.zeros_like(m0rho - bg), np.zeros_like(m0chi)]
+
+    reg_rho = regularization.WeightedLeastSquares(
+        mesh, active_cells=active, mapping=wires.density,
+        alpha_s=5e-4, alpha_x=5e-4, alpha_y=5e-4, alpha_z=5e-4,
+        reference_model=mref_joint
+    )
+    reg_chi = regularization.WeightedLeastSquares(
+        mesh, active_cells=active, mapping=wires.chi,
+        alpha_s=1e-3, alpha_x=1e-3, alpha_y=1e-3, alpha_z=float(alpha_z_chi),
+        reference_model=mref_joint
+    )
+    reg = reg_rho + reg_chi
+
+    lower = np.r_[np.zeros(nA) - bg, np.zeros(nA) + 0.0]
+    upper = np.r_[np.zeros(nA) + 5.0 - bg, np.zeros(nA) + 2.0]
+    opt = optimization.ProjectedGNCG(maxIter=40, lower=lower, upper=upper)
+    dirs = [
+        directives.UpdateSensitivityWeights(),
+        directives.BetaEstimate_ByEig(beta0_ratio=0.5),
+        directives.BetaSchedule(coolingFactor=3, coolingRate=1.0),
+        directives.Update_IRLS(max_irls_iterations=20, f_min_change=1e-4),
+    ]
+    invp = inverse_problem.BaseInvProblem(dmis, reg, opt)
+    inv  = inversion.BaseInversion(invp, directiveList=dirs)
+
+    mrec_joint = inv.run(mstart_joint)
+    wires_out = maps.Wires(("density", nA), ("chi", nA))
+    rho_rec = (wires_out.density * mrec_joint) + bg
+    chi_rec = (wires_out.chi * mrec_joint)
+    out["rho_rec"] = rho_rec; out["chi_rec"] = chi_rec
+
+    # 2D
+    cuts_rho = fixed_slices if (fixed_slices is not None) else _select_auto_slices(mesh, active, m0rho, bg=rho_background)
+    _ = _plot_density_results(mesh, active, m0rho, rho_rec, topo_xyz, xyz_all, bg_val=rho_background,
+                              fixed_slices=cuts_rho, slice_source="recovered")
+    cuts_chi = cuts_rho if (fixed_slices is not None) else _select_auto_slices(mesh, active, m0chi, bg=0.0)
+    _ = _plot_scalar_results(mesh, active, m0chi, chi_rec, label="Susceptibilidad (SI)",
+                             fixed_slices=cuts_chi, bg=0.0, slice_source="recovered")
+
+    # 3D (escala desde los previos)
+    vmin_d = float(np.nanmin(m0rho)); vmax_d = float(np.nanmax(m0rho))
+    if not (vmax_d > vmin_d):
+        eps = 1e-9 if vmin_d == 0.0 else 1e-6*abs(vmin_d) + 1e-9
+        vmin_d -= eps; vmax_d += eps
+    _plot_model_3d(mesh, active, m0rho, rho_rec, "Densidad (g/cc)",
+                   vmin=vmin_d, vmax=vmax_d, alpha=1.0,
+                   stride=stride_3d, plot_strip_top_layers=plot_strip_top_layers)
+
+    vmin_k = float(np.nanmin(m0chi)); vmax_k = float(np.nanmax(m0chi))
+    if not (vmax_k > vmin_k):
+        eps = 1e-9 if vmin_k == 0.0 else 1e-6*abs(vmin_k) + 1e-9
+        vmin_k -= eps; vmax_k += eps
+    _plot_model_3d(mesh, active, m0chi, chi_rec, "Susceptibilidad (SI)",
+                   vmin=vmin_k, vmax=vmax_k, alpha=1.0,
+                   stride=stride_3d, plot_strip_top_layers=plot_strip_top_layers)
+    return out
+
+# =========================
+# CONFIGURACIÓN (SINTÉTICOS)
+# =========================
+BASE = "/content/drive/MyDrive/Tesis"
+SYN_DIR = os.path.join(BASE, "Sinteticos")
+
+# Escenario y datos
+ESCENARIO = "liviano"   # "esquematico" | "denso_profundo" | "liviano" | "multicuerpos" | "falla_normal"
+DATA_SYN  = os.path.join(SYN_DIR, ESCENARIO, "datos_sinteticos_anom.csv")
+
+# Malla
+DH   = 150.0
+NZ   = 40
+ZTOP = None   # auto = max(Z estaciones) + 0.5*DH
+PAD  = 0.0
+
+# Campo magnético (si usas magnetics)
+B0, INC, DEC = 30055.6, 26.78927, -7.63654
+
+# Cortes (opcional)
+USE_FIXED_CUTS = False
+Z_CUT = 1500.0
+Y_CUT = None
+FIXED_SLICES = None
+if USE_FIXED_CUTS:
+    df_tmp = pd.read_csv(DATA_SYN)
+    Y_MED = float(df_tmp["Y"].median()) if (Y_CUT is None) else float(Y_CUT)
+    FIXED_SLICES = (float(Z_CUT), Y_MED, None, None)  # depth_top/bottom los resuelve la función
+
+# Modelo previo (opcional)
+USE_PRIOR = True
+PRIOR_MODEL = os.path.join(SYN_DIR, ESCENARIO, "modelo_mesh.csv")
+
+# Visual
+STRIDE_3D = (1,1,1)
+PLOT_STRIP_TOP = 1   # “pela” solo en el plot 1 capa; 0 = no pelar
+
+print("ESCENARIO:", ESCENARIO)
+print("CSV     :", DATA_SYN)
+
+# ---------- Ejecutar: GRAVITY ----------
+res_syn_grav = invert_synth_with_options(
+    data_csv=DATA_SYN, dh=DH, nz=NZ, z_top=ZTOP, pad=PAD,
+    inv_type="gravity",
+    fixed_slices=FIXED_SLICES,
+    strip_top_layers=0,                 # no recortes en inversión
+    stride_3d=STRIDE_3D, plot_strip_top_layers=PLOT_STRIP_TOP,
+    use_prior=USE_PRIOR, prior_model_file=(PRIOR_MODEL if USE_PRIOR else None)
+)
+
+# ---------- Ejecutar: MAG_GRADIOMETRY ----------
+res_syn_mag = invert_synth_with_options(
+    data_csv=DATA_SYN, dh=DH, nz=NZ, z_top=ZTOP, pad=PAD,
+    inv_type="mag_gradiometry",
+    B0=B0, inc=INC, dec=DEC,
+    fixed_slices=FIXED_SLICES,
+    strip_top_layers=0,
+    stride_3d=STRIDE_3D, plot_strip_top_layers=PLOT_STRIP_TOP,
+    use_prior=USE_PRIOR, prior_model_file=(PRIOR_MODEL if USE_PRIOR else None)
+)
+
+# ---------- Ejecutar: JOINT ----------
+res_syn_joint = invert_synth_with_options(
+    data_csv=DATA_SYN, dh=DH, nz=NZ, z_top=ZTOP, pad=PAD,
+    inv_type="joint",
+    B0=B0, inc=INC, dec=DEC,
+    fixed_slices=FIXED_SLICES,
+    strip_top_layers=0,
+    stride_3d=STRIDE_3D, plot_strip_top_layers=PLOT_STRIP_TOP,
+    use_prior=USE_PRIOR, prior_model_file=(PRIOR_MODEL if USE_PRIOR else None)
+)

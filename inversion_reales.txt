@@ -1,0 +1,942 @@
+# -*- coding: utf-8 -*-
+# Inversión: gravity | mag_gradiometry (bxx..bzz) | joint (gravity + mag_gradiometry)
+# Limpieza: solo se dejaron utilidades y imports que usa el flujo actual.
+
+import os
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import rasterio
+from rasterio.warp import calculate_default_transform, reproject
+from rasterio.enums import Resampling
+from pyproj import Transformer
+from discretize import TensorMesh
+from discretize.utils import active_from_xyz
+from shapely.vectorized import contains
+from scipy.spatial import cKDTree
+from simpeg import maps, data, data_misfit, regularization, optimization, inverse_problem, directives, inversion
+from simpeg.potential_fields import gravity, magnetics
+import matplotlib.pyplot as plt
+from matplotlib import cm, colors
+import re
+try:
+    from shapely import contains_xy as _contains_xy
+except Exception:
+    from shapely.vectorized import contains as _contains_xy
+
+
+# -------------------- utilidades base --------------------
+
+def _union_all(geo):
+    gs = getattr(geo, "geometry", geo)
+    ua = getattr(gs, "union_all", None)
+    return ua() if callable(ua) else gs.unary_union
+
+
+def auto_y_cut_from_shape(dem_file, shape_path):
+    # Y del centroide del polígono en el CRS del DEM
+    _, _, dst_crs = read_dem(dem_file)
+    gdf = gpd.read_file(shape_path).to_crs(dst_crs)
+    geom = getattr(gdf, "geometry", gdf)
+    union = getattr(geom, "union_all", None)
+    poly = union() if callable(union) else geom.unary_union
+    return float(poly.centroid.y)
+
+
+def integrate_mag_grad_files(mag_grad_files, utm_crs):
+    ALT_ALIASES = [r"^Z$", r"^Altura$", r"^Altura_?m$", r"^Altitude$", r"^Elev(ation)?$", r"^altura$"]
+
+    def _pick_alt_col(df):
+        for c in df.columns:
+            if any(re.fullmatch(p, c.strip()) for p in ALT_ALIASES):
+                return c
+        return None
+
+    utm_str = utm_crs if isinstance(utm_crs, str) else utm_crs.to_string()
+    tr = Transformer.from_crs("EPSG:4326", utm_str, always_xy=True)
+
+    frames = []
+    for i, path in enumerate(mag_grad_files, 1):
+        df = pd.read_csv(path).copy()
+        df["line_id"] = i
+
+        # XY
+        if {"X","Y"}.issubset(df.columns):
+            X = df["X"].astype(float).values
+            Y = df["Y"].astype(float).values
+        else:
+            if not {"Latitud","Longitud"}.issubset(df.columns):
+                raise KeyError(f"{path} debe tener X,Y o Latitud,Longitud")
+            X, Y = tr.transform(df["Longitud"].astype(float).values,
+                                df["Latitud"].astype(float).values)
+
+        # Z
+        alt_col = _pick_alt_col(df)
+        Z = df[alt_col].astype(float).values if alt_col else np.zeros(len(df))
+
+        # gradientes
+        bxx = (df["bxx"] if "bxx" in df.columns else df["dB_E_dE"]).astype(float).values
+        byy = (df["byy"] if "byy" in df.columns else df["dB_N_dN"]).astype(float).values
+        bzz = (df["bzz"] if "bzz" in df.columns else df["dB_V_dZ"]).astype(float).values
+
+        frames.append(pd.DataFrame({"X":X,"Y":Y,"Z":Z,"bxx":bxx,"byy":byy,"bzz":bzz,"line_id":df["line_id"]}))
+
+    out = pd.concat(frames, ignore_index=True)
+    return out[["X","Y","Z","bxx","byy","bzz","line_id"]]
+
+
+def read_dem(dem_file):
+    with rasterio.open(dem_file) as src:
+        if src.crs.is_geographic:
+            dst_crs = "EPSG:32618"
+            transform, w, h = calculate_default_transform(
+                src.crs, dst_crs, src.width, src.height, *src.bounds
+            )
+            topo = np.empty((h, w), dtype=np.float32)
+            reproject(
+                source=src.read(1), destination=topo,
+                src_transform=src.transform, src_crs=src.crs,
+                dst_transform=transform, dst_crs=dst_crs,
+                resampling=Resampling.bilinear
+            )
+        else:
+            topo = src.read(1)
+            transform = src.transform
+            dst_crs = src.crs
+
+    rows, cols = np.indices(topo.shape)
+    xs, ys = rasterio.transform.xy(transform, rows, cols, offset="center")
+    topo_xyz = np.column_stack([np.array(xs).ravel(),
+                                np.array(ys).ravel(),
+                                topo.ravel()])
+    return topo, topo_xyz, dst_crs
+
+
+def build_mesh_and_active(xyz, topo_xyz, dh=150., nz=40, z_top=3000., pad=0.):
+    x0, x1 = xyz[:,0].min()-pad, xyz[:,0].max()+pad
+    y0, y1 = xyz[:,1].min()-pad, xyz[:,1].max()+pad
+    nx = int(np.ceil((x1-x0)/dh))
+    ny = int(np.ceil((y1-y0)/dh))
+    z0 = z_top - dh*nz
+    mesh = TensorMesh([[dh]*nx, [dh]*ny, [dh]*nz], x0=[x0, y0, z0])
+    active = active_from_xyz(mesh, topo_xyz)
+    return mesh, active
+
+
+# -------------------- PRIOR CSV → MESH (v6 con datum) --------------------
+
+def load_prior_model_csv(
+    csv_file, mesh, active,
+    prop="densidad", xcol="X", ycol="Y", zcol="Z",
+    xy_shift=None,
+    z_is_depth=False, z_offset=0.0,
+    topo_xyz=None,
+    auto_calibrate=True,
+    sample=20000,
+    depth_datum="topo",      # "topo" | "flat"
+    ref_elev="auto",         # si "flat": cota Z_REF o "auto"
+    depth_offset_scan=300.0
+):
+    """CSV -> vector en celdas activas (NN3D) con manejo de profundidad vs elevación."""
+    print("[load_prior_model_csv] v6 (depth-datum: topo|flat)")
+
+    df = pd.read_csv(csv_file)
+
+    # detectar columna de propiedad
+    prop_alias = {
+        "densidad": ["densidad","density","dens","rho","rho_gcc","dens_gcc","densidad_gcc","rho_(g/cc)","rho_g/cc"],
+        "susceptibilidad": ["susceptibilidad","susceptibility","chi","k","kappa","susc","susc_si","sus_si","susceptibilidad_si","suscept_(si)"]
+    }
+    key = "densidad" if prop.lower().startswith("dens") else "susceptibilidad"
+    cols_original = list(df.columns)
+    cols_lower = [c.strip().lower() for c in cols_original]
+
+    target = None
+    for alias in prop_alias[key]:
+        if alias in cols_lower:
+            target = cols_original[cols_lower.index(alias)]
+            break
+    if target is None:
+        patt = re.compile(r"(dens|rho)" if key=="densidad" else r"(susc|suscep|chi|kappa|(^|\W)k($|\W))", re.I)
+        candidates = [c for c in cols_original if patt.search(c)]
+        if candidates:
+            vari = [(c, float(np.nanvar(pd.to_numeric(df[c], errors="coerce")))) for c in candidates]
+            vari.sort(key=lambda x: x[1], reverse=True)
+            target = vari[0][0]
+    if target is None:
+        raise KeyError(f"No se encontró columna de '{key}' en {csv_file}.\nColumnas: {cols_original}")
+    print(f"[load_prior_model_csv] usando columna '{target}' para {key}")
+
+    if not {xcol, ycol, zcol}.issubset(df.columns):
+        raise KeyError(f"El CSV debe tener columnas {xcol},{ycol},{zcol}")
+
+    pts = df[[xcol, ycol, zcol]].astype(float).values
+    Zraw = pts[:, 2].copy()
+    if xy_shift is not None:
+        dx, dy = float(xy_shift[0]), float(xy_shift[1])
+        pts[:, 0] += dx
+        pts[:, 1] += dy
+
+    vals = pd.to_numeric(df[target], errors="coerce").astype(float).values
+
+    if topo_xyz is None:
+        raise ValueError("Se requiere 'topo_xyz' para tratar Z correctamente.")
+
+    topo_tree2 = cKDTree(topo_xyz[:, :2])
+    idx_topo = topo_tree2.query(pts[:, :2], k=1)[1]
+    tz_all = topo_xyz[idx_topo, 2]
+
+    CC_act = mesh.gridCC[active]
+    CC_tree3 = cKDTree(CC_act)
+
+    auto_mode   = (isinstance(z_is_depth, str) and z_is_depth.lower() in ("auto","detect")) or (z_is_depth is None)
+    auto_offset = (isinstance(z_offset,   str) and z_offset.lower()   in ("auto","detect"))
+
+    if auto_calibrate and (auto_mode or auto_offset):
+        n = len(pts)
+        take = np.arange(n) if n <= sample else np.random.default_rng(12345).choice(n, size=sample, replace=False)
+        Xs, Ys = pts[take, 0].copy(), pts[take, 1].copy()
+        Zraw_s = Zraw[take].copy()
+        tz_s   = tz_all[take].copy()
+
+        if str(depth_datum).lower() == "flat":
+            Z_REF = float(ref_elev) if isinstance(ref_elev, (int, float)) else float(np.nanmedian(tz_s))
+            print(f"[autoZ] datum='flat'  Z_REF={Z_REF:.2f} m")
+        else:
+            Z_REF = None
+
+        def score_for(mode, offset):
+            if mode == "depth":
+                Ze = (Z_REF - Zraw_s + offset) if (Z_REF is not None) else (tz_s - Zraw_s + offset)
+            else:
+                Ze = Zraw_s + offset
+            Q = np.column_stack([Xs, Ys, Ze])
+            _, idxN = CC_tree3.query(Q, k=1)
+            dz = np.abs(CC_act[idxN, 2] - Ze)
+            return float(np.median(dz)), float(np.percentile(dz, 95)), float(np.max(dz))
+
+        offsets_depth = np.linspace(-abs(depth_offset_scan), abs(depth_offset_scan), 25)
+        offsets_elev  = np.linspace(-5000.0, 5000.0, 51)
+
+        modes_to_try = ["depth","elev"] if auto_mode else (["depth"] if bool(z_is_depth) else ["elev"])
+        best = {"mode": None, "offset": 0.0, "med": np.inf, "p95": np.inf, "max": np.inf}
+
+        for mode in modes_to_try:
+            test_offsets = offsets_depth if (auto_offset and mode=="depth") else (offsets_elev if auto_offset else [float(z_offset)])
+            for off in test_offsets:
+                med, p95, mx = score_for(mode, off)
+                if med < best["med"]:
+                    best.update({"mode": mode, "offset": float(off), "med": med, "p95": p95, "max": mx})
+
+        z_is_depth = (best["mode"] == "depth") if auto_mode else bool(z_is_depth)
+        z_offset   = float(best["offset"])     if auto_offset else float(z_offset)
+        print(f"[autoZ] modo={best['mode']}  offset={best['offset']:.1f} m  |ΔZ| p50={best['med']:.1f}  p95={best['p95']:.1f}  max={best['max']:.1f} m")
+
+    dd = str(depth_datum).lower()
+    if bool(z_is_depth):
+        if dd == "flat":
+            Z_REF = float(ref_elev) if isinstance(ref_elev, (int, float)) else float(np.nanmedian(tz_all))
+            pts[:, 2] = Z_REF - Zraw + float(z_offset)
+        else:
+            pts[:, 2] = tz_all - Zraw + float(z_offset)
+    else:
+        pts[:, 2] = Zraw + float(z_offset)
+
+    tree_csv = cKDTree(pts)
+    d3, idxN = tree_csv.query(CC_act, k=1)
+    med = float(np.median(d3)); p95 = float(np.percentile(d3, 95)); mx = float(np.max(d3))
+    print(f"[NN CSV→mesh] d3 median={med:.1f} m  p95={p95:.1f} m  max={mx:.1f} m (z_is_depth={bool(z_is_depth)}, z_offset={float(z_offset):.1f}, datum={depth_datum})")
+
+    return vals[idxN].astype(float)
+
+
+def auto_align_prior_xy(prior_csv, dem_file, grav_file, src_crs=None,
+                        dh=150., nz=40, z_top=3000.):
+    """Rotación pequeña + shift XY (por centroides + mediana NN). Devuelve (rot_deg, (dx,dy))."""
+    _, topo_xyz, utm_crs = read_dem(dem_file)
+    utm_str = utm_crs if isinstance(utm_crs, str) else utm_crs.to_string()
+
+    # Grav -> UTM
+    ext = os.path.splitext(grav_file)[1].lower()
+    if ext in (".xls", ".xlsx"):
+        df0 = pd.read_excel(grav_file)
+        df = df0.rename(columns={"Lat (°)":"Lat","Long (°)":"Lon","Height (m)":"Z","ΔB (mGal)":"gz"})
+        tf = Transformer.from_crs("EPSG:4326", utm_str, always_xy=True)
+        df["X"], df["Y"] = tf.transform(df.Lon.values, df.Lat.values)
+    else:
+        df = pd.read_csv(grav_file)
+    xyz_g = df[["X","Y","Z"]].values
+
+    mesh, active = build_mesh_and_active(xyz_g, topo_xyz, dh=dh, nz=nz, z_top=z_top)
+    CC = mesh.gridCC[active][:, :2]
+
+    d = pd.read_csv(prior_csv)
+    if {"X","Y"}.issubset(d.columns):
+        P = d[["X","Y"]].astype(float).values
+    elif {"Longitud","Latitud"}.issubset(d.columns) and (src_crs is not None):
+        tr = Transformer.from_crs(src_crs, utm_str, always_xy=True)
+        X, Y = tr.transform(d["Longitud"].astype(float).values, d["Latitud"].astype(float).values)
+        P = np.column_stack([X, Y])
+    else:
+        raise ValueError("El CSV debe tener X,Y o (Longitud,Latitud)+src_crs.")
+
+    def _rot2d(xy, deg, center):
+        th = np.deg2rad(deg); c, s = np.cos(th), np.sin(th)
+        R = np.array([[c, -s],[s, c]])
+        return (xy - center) @ R.T + center
+
+    rot_list = [-10, -5, -2, -1, 0, 1, 2, 5, 10]
+    Cc = P.mean(axis=0)
+    treeCC = cKDTree(CC)
+    best = {"score": np.inf, "rot": 0.0, "shift": (0.0, 0.0), "med": np.inf, "p95": np.inf, "max": np.inf}
+
+    for rot in rot_list:
+        P_rot = _rot2d(P, rot, center=Cc)
+        shift0 = CC.mean(axis=0) - P_rot.mean(axis=0)
+        P1 = P_rot + shift0
+        idx = treeCC.query(P1, k=1)[1]
+        deltas = CC[idx] - P1
+        shift_ref = np.median(deltas, axis=0)
+        shift = shift0 + shift_ref
+
+        P2 = P_rot + shift
+        dNN = treeCC.query(P2, k=1)[0]
+        med = float(np.median(dNN)); p95 = float(np.percentile(dNN, 95)); dmx = float(np.max(dNN))
+        if med < best["score"]:
+            best = {"score": med, "rot": float(rot), "shift": (float(shift[0]), float(shift[1])),
+                    "med": med, "p95": p95, "max": dmx}
+
+    print(f"[auto_align_prior_xy] Mejor rot={best['rot']}°  shift=({best['shift'][0]:.4f}, {best['shift'][1]:.4f})")
+    print(f"[auto_align_prior_xy] dNN -> p50={best['med']:.1f}  p95={best['p95']:.1f}  max={best['max']:.1f}")
+    return best["rot"], best["shift"]
+
+
+# -------------------- Visualización --------------------
+
+def _select_auto_slices(mesh, active, ref_vec, bg=None):
+    shape = mesh.shape_cells
+    vol = np.full(shape, np.nan, order="F")
+    act_idx = np.where(active)[0]
+    act_idx_3D = np.unravel_index(act_idx, shape, order="F")
+    vol[act_idx_3D] = ref_vec
+    if bg is not None:
+        vol = np.abs(vol - bg)
+    z_idx = int(np.nanargmax(np.nanmean(vol, axis=(0, 1))))
+    y_idx = int(np.nanargmax(np.nanmean(vol, axis=(0, 2))))
+    zs = mesh.cell_centers_z
+    return (z_idx, y_idx, float(np.max(zs)), float(np.min(zs)))
+
+
+def _plot_density_results(
+    mesh, active, m0, rho_rec, topo_xyz, xyz, zone_props, fixed_slices=None,
+    slice_source="recovered"
+):
+    xs = mesh.cell_centers_x; ys = mesh.cell_centers_y; zs = mesh.cell_centers_z
+    shape = mesh.shape_cells
+    bg = zone_props["background"]
+
+    dens0_3D = np.full(shape, np.nan, order="F"); densR_3D = np.full(shape, np.nan, order="F")
+    act_idx = np.where(active)[0]; act_idx_3D = np.unravel_index(act_idx, shape, order="F")
+    dens0_3D[act_idx_3D] = m0; densR_3D[act_idx_3D] = rho_rec
+
+    if fixed_slices is None:
+        if slice_source.lower().startswith("rec"):
+            z_idx, y_idx, depth_top, depth_bottom = _select_auto_slices(mesh, active, rho_rec, bg=bg)
+        else:
+            z_idx, y_idx, depth_top, depth_bottom = _select_auto_slices(mesh, active, m0, bg=bg)
+    else:
+        z_idx, y_idx, depth_top, depth_bottom = fixed_slices
+
+    zlev = zs[z_idx]; ylev = ys[y_idx]
+    z_mask = (zs >= depth_bottom) & (zs <= depth_top)
+
+    fig = plt.figure(figsize=(16, 18)); gs = fig.add_gridspec(3, 2)
+
+    ax1 = fig.add_subplot(gs[0, 0])
+    im1 = ax1.imshow(dens0_3D[:, :, z_idx].T, extent=[xs.min(), xs.max(), ys.min(), ys.max()],
+                     origin="lower", cmap="viridis", vmin=1.9, vmax=2.9)
+    ax1.set_title(f"Corte Horizontal @ Z = {zlev:.1f} m (Inicial)")
+    plt.colorbar(im1, ax=ax1, label="Densidad (g/cc)")
+    ax1.scatter(xyz[:, 0], xyz[:, 1], c="white", s=10, marker="o", alpha=0.5, label="Estaciones"); ax1.legend()
+
+    ax2 = fig.add_subplot(gs[0, 1])
+    im2 = ax2.imshow(densR_3D[:, :, z_idx].T, extent=[xs.min(), xs.max(), ys.min(), ys.max()],
+                     origin="lower", cmap="viridis", vmin=1.0, vmax=5.0)
+    ax2.set_title(f"Corte Horizontal @ Z = {zlev:.1f} m (Recuperado)")
+    plt.colorbar(im2, ax=ax2, label="Densidad (g/cc)")
+    ax2.scatter(xyz[:, 0], xyz[:, 1], c="white", s=10, marker="o", alpha=0.5, label="Estaciones"); ax2.legend()
+
+    ax3 = fig.add_subplot(gs[1, 0])
+    im3 = ax3.imshow(dens0_3D[:, y_idx, :].T[z_mask, :],
+                     extent=[xs.min(), xs.max(), depth_bottom, depth_top],
+                     origin="lower", cmap="viridis", aspect="auto", vmin=1.9, vmax=2.9)
+    ax3.set_title(f"Corte Vertical @ Y = {ylev:.1f} m (Inicial)")
+    plt.colorbar(im3, ax=ax3, label="Densidad (g/cc)")
+
+    ax4 = fig.add_subplot(gs[1, 1])
+    im4 = ax4.imshow(densR_3D[:, y_idx, :].T[z_mask, :],
+                     extent=[xs.min(), xs.max(), depth_bottom, depth_top],
+                     origin="lower", cmap="viridis", aspect="auto", vmin=1.0, vmax=5.0)
+    ax4.set_title(f"Corte Vertical @ Y = {ylev:.1f} m (Recuperado)")
+    plt.colorbar(im4, ax=ax4, label="Densidad (g/cc)")
+
+    plt.tight_layout(); plt.show()
+    return (z_idx, y_idx, depth_top, depth_bottom)
+
+
+def _plot_scalar_results(
+    mesh, active, m0, mrec, topo_xyz, label="Propiedad",
+    vmin=None, vmax=None, fixed_slices=None, bg=None,
+    slice_source="recovered"
+):
+    xs = mesh.cell_centers_x; ys = mesh.cell_centers_y; zs = mesh.cell_centers_z
+    shape = mesh.shape_cells
+
+    m0_3D = np.full(shape, np.nan, order="F"); mr_3D = np.full(shape, np.nan, order="F")
+    act_idx = np.where(active)[0]; act_idx_3D = np.unravel_index(act_idx, shape, order="F")
+    m0_3D[act_idx_3D] = m0; mr_3D[act_idx_3D] = mrec
+
+    if fixed_slices is None:
+        ref = mrec if slice_source.lower().startswith("rec") else m0
+        z_idx, y_idx, depth_top, depth_bottom = _select_auto_slices(mesh, active, ref, bg=bg)
+    else:
+        z_idx, y_idx, depth_top, depth_bottom = fixed_slices
+
+    zlev = zs[z_idx]; ylev = ys[y_idx]
+    z_mask = (zs >= depth_bottom) & (zs <= depth_top)
+    vmin = float(vmin) if vmin is not None else float(np.nanmin([np.nanmin(m0), np.nanmin(mrec)]))
+    vmax = float(vmax) if vmax is not None else float(np.nanmax([np.nanmax(m0), np.nanmax(mrec)]))
+
+    fig = plt.figure(figsize=(16, 18)); gs = fig.add_gridspec(2, 2)
+
+    ax1 = fig.add_subplot(gs[0, 0])
+    im1 = ax1.imshow(m0_3D[:, :, z_idx].T, extent=[xs.min(), xs.max(), ys.min(), ys.max()],
+                     origin="lower", cmap="viridis", vmin=vmin, vmax=vmax)
+    ax1.set_title(f"Corte Horizontal @ Z = {zlev:.1f} m (Inicial)"); plt.colorbar(im1, ax=ax1, label=label)
+
+    ax2 = fig.add_subplot(gs[0, 1])
+    im2 = ax2.imshow(mr_3D[:, :, z_idx].T, extent=[xs.min(), xs.max(), ys.min(), ys.max()],
+                     origin="lower", cmap="viridis", vmin=vmin, vmax=vmax)
+    ax2.set_title(f"Corte Horizontal @ Z = {zlev:.1f} m (Recuperado)"); plt.colorbar(im2, ax=ax2, label=label)
+
+    ax3 = fig.add_subplot(gs[1, 0])
+    im3 = ax3.imshow(m0_3D[:, y_idx, :].T[z_mask, :],
+                     extent=[xs.min(), xs.max(), depth_bottom, depth_top],
+                     origin="lower", cmap="viridis", aspect="auto", vmin=vmin, vmax=vmax)
+    ax3.set_title(f"Corte Vertical @ Y = {ylev:.1f} m (Inicial)"); plt.colorbar(im3, ax=ax3, label=label)
+
+    ax4 = fig.add_subplot(gs[1, 1])
+    im4 = ax4.imshow(mr_3D[:, y_idx, :].T[z_mask, :],
+                     extent=[xs.min(), xs.max(), depth_bottom, depth_top],
+                     origin="lower", cmap="viridis", aspect="auto", vmin=vmin, vmax=vmax)
+    ax4.set_title(f"Corte Vertical @ Y = {ylev:.1f} m (Recuperado)"); plt.colorbar(im4, ax=ax4, label=label)
+
+    plt.tight_layout(); plt.show()
+    return (z_idx, y_idx, depth_top, depth_bottom)
+
+
+def _plot_model_3d(mesh, active, m_init, m_rec, label, vmin=None, vmax=None, alpha=0.8, stride=(1,1,1)):
+    shape = mesh.shape_cells
+    m0_3D = np.full(shape, np.nan, order="F"); mr_3D = np.full(shape, np.nan, order="F")
+    act_idx = np.where(active)[0]; act_idx_3D = np.unravel_index(act_idx, shape, order="F")
+    m0_3D[act_idx_3D] = m_init; mr_3D[act_idx_3D] = m_rec
+
+    sx, sy, sz = stride
+    m0_3D = m0_3D[::sx, ::sy, ::sz]; mr_3D = mr_3D[::sx, ::sy, ::sz]
+    xe = mesh.nodes_x[::sx]; ye = mesh.nodes_y[::sy]; ze = mesh.nodes_z[::sz]
+    X, Y, Z = np.meshgrid(xe, ye, ze, indexing="ij")
+
+    vmin0 = float(np.nanmin(m_init)); vmax0 = float(np.nanmax(m_init))
+    vminR = float(vmin) if vmin is not None else float(np.nanmin(m_rec))
+    vmaxR = float(vmax) if vmax is not None else float(np.nanmax(m_rec))
+
+    cmap = cm.get_cmap("viridis")
+    norm0 = colors.Normalize(vmin=vmin0, vmax=vmax0)
+    normR = colors.Normalize(vmin=vminR, vmax=vmaxR)
+    sm0 = cm.ScalarMappable(norm=norm0, cmap=cmap); sm0.set_array([])
+    smR = cm.ScalarMappable(norm=normR, cmap=cmap); smR.set_array([])
+
+    def _colorize(vol, norm):
+        filled = ~np.isnan(vol)
+        rgba = cmap(norm(np.where(filled, vol, np.nan)))
+        rgba[..., 3] = np.where(filled, alpha, 0.0)
+        return filled, rgba
+
+    filled0, fc0 = _colorize(m0_3D, norm0)
+    filledR, fcR = _colorize(mr_3D, normR)
+
+    fig = plt.figure(figsize=(14, 6))
+    ax1 = fig.add_subplot(121, projection="3d")
+    ax1.voxels(X, Y, Z, filled0, facecolors=fc0, edgecolor="none")
+    ax1.set_title(f"Inicial – {label}"); ax1.set_xlabel("X"); ax1.set_ylabel("Y"); ax1.set_zlabel("Z")
+    fig.colorbar(sm0, ax=ax1, fraction=0.046, pad=0.4/10, label=label)
+
+    ax2 = fig.add_subplot(122, projection="3d")
+    ax2.voxels(X, Y, Z, filledR, facecolors=fcR, edgecolor="none")
+    ax2.set_title(f"Recuperado – {label}"); ax2.set_xlabel("X"); ax2.set_ylabel("Y"); ax2.set_zlabel("Z")
+    fig.colorbar(smR, ax=ax2, fraction=0.046, pad=0.4/10, label=label)
+
+    plt.tight_layout(); plt.show()
+
+
+# -------------------- Inversión principal --------------------
+
+def invert_with_options(
+    dem_file, grav_file, shapefiles, zone_props,
+    depth_limit=600., dome_depth=600., under_depth=2000.,
+    dh=150., nz=40, z_top=3000.,
+    inv_type="gravity",
+    prior_model_file=None, prior_model_property="densidad",   # "densidad" | "susceptibilidad" | "both"
+    prior_depth_reference="topo", prior_ref_elev="auto",
+    mag_grad_file=None, mag_grad_files=None, mag_components=None,
+    B0=30055.6, inc=26.78927, dec=-7.63654,
+    fixed_slices=None,
+    rho_init_source="auto"  # "auto" | "prior" | "shapes" | "background"
+):
+    # normalización
+    it = inv_type.strip().lower() if isinstance(inv_type, str) and inv_type.strip() else ""
+    synonyms = {"grav":"gravity","gz":"gravity","g":"gravity",
+                "mag":"mag_gradiometry","magnetics":"mag_gradiometry","mag_grads":"mag_gradiometry"}
+    inv_type_l = synonyms.get(it, it)
+    if inv_type_l not in {"gravity","mag_gradiometry","joint"}:
+        inv_type_l = "joint" if (mag_grad_file is not None or mag_grad_files is not None) else "gravity"
+    INV_IS_GRAV  = (inv_type_l == "gravity")
+    INV_IS_MAG   = (inv_type_l == "mag_gradiometry")
+    INV_IS_JOINT = (inv_type_l == "joint")
+
+    if mag_grad_files is None and mag_grad_file is not None:
+        mag_grad_files = [mag_grad_file]
+
+    # fallbacks globales
+    try: prior_ref_weight_rho = PRIOR_REF_WEIGHT_RHO
+    except NameError: prior_ref_weight_rho = 0.30
+    try: prior_ref_weight_chi = PRIOR_REF_WEIGHT_CHI
+    except NameError: prior_ref_weight_chi = 0.30
+    try: prior_xy_shift = PRIOR_XY_SHIFT
+    except NameError: prior_xy_shift = (0.0, 0.0)
+    try: prior_z_is_depth = PRIOR_Z_IS_DEPTH
+    except NameError: prior_z_is_depth = False
+    try: prior_z_offset = PRIOR_Z_OFFSET
+    except NameError: prior_z_offset = 0.0
+
+    # 1) DEM
+    topo, topo_xyz, utm_crs = read_dem(dem_file)
+
+    # 2) GRAV
+    ext = os.path.splitext(grav_file)[1].lower()
+    if ext in (".xls",".xlsx"):
+        df0 = pd.read_excel(grav_file)
+        df = df0.rename(columns={"Lat (°)":"Lat","Long (°)":"Lon","Height (m)":"Z","ΔB (mGal)":"gz"})
+        tf = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+        df["X"], df["Y"] = tf.transform(df.Lon.values, df.Lat.values)
+    else:
+        df = pd.read_csv(grav_file)
+    if not {"X","Y","Z","gz"}.issubset(df.columns):
+        raise KeyError("El archivo de gravedad debe tener columnas X,Y,Z,gz")
+    xyz_g  = df[["X","Y","Z"]].values
+    gz_obs = df["gz"].values.astype(float)
+    std_g = np.std(gz_obs); std_g = std_g if std_g > 1e-9 else 1.0
+    errs_g = std_g*np.ones_like(gz_obs)
+
+    # 3) Malla activa
+    mesh, active = build_mesh_and_active(xyz_g, topo_xyz, dh, nz, z_top)
+    CC_act = mesh.gridCC[active]
+    _, idx_top = cKDTree(topo_xyz[:, :2]).query(CC_act[:, :2])
+    tz = topo_xyz[idx_top, 2]
+
+    # 4) Modelos iniciales
+    bg = zone_props["background"]
+    m0rho = np.ones(active.sum()) * bg
+    m0chi = None
+    init_source = "background"
+
+    use_prior    = (prior_model_file is not None)
+    force_prior  = (rho_init_source == "prior")
+    force_shapes = (rho_init_source == "shapes")
+    force_bg     = (rho_init_source == "background")
+
+    if INV_IS_GRAV or INV_IS_JOINT:
+        if force_bg:
+            init_source = "background"
+        elif force_prior or (rho_init_source == "auto" and use_prior):
+            m0rho = load_prior_model_csv(
+                prior_model_file, mesh, active, prop="densidad",
+                xy_shift=prior_xy_shift,
+                z_is_depth=prior_z_is_depth, z_offset=prior_z_offset,
+                topo_xyz=topo_xyz,
+                depth_datum=prior_depth_reference, ref_elev=prior_ref_elev,
+                auto_calibrate=False
+            )
+            init_source = "prior CSV (densidad)"
+        elif force_shapes or (rho_init_source == "auto" and not use_prior):
+            gdfs = {k: gpd.read_file(v).to_crs(utm_crs) for k, v in shapefiles.items()}
+            for zn in ["unidades","flujos","crater","domo"]:
+                d = zone_props[zn]["dens"]
+                poly = _union_all(gdfs[zn])
+                mxy = _contains_xy(poly, CC_act[:,0], CC_act[:,1])
+                mz  = (CC_act[:,2] <= tz) & (CC_act[:,2] >= tz - dome_depth)
+                m0rho[mxy & mz] = d
+            poly_dome = _union_all(gdfs["domo"])
+            mxy_dome  = _contains_xy(poly_dome, CC_act[:,0], CC_act[:,1])
+            uz = (CC_act[:,2] < tz - dome_depth) & (CC_act[:,2] >= tz - under_depth)
+            m0rho[mxy_dome & uz] = zone_props["under_dome"]["dens"]
+            init_source = "shapefiles"
+
+    if INV_IS_MAG or INV_IS_JOINT:
+        m0chi = None
+        if use_prior and prior_model_property in ("susceptibilidad","both"):
+            try:
+                m0chi = load_prior_model_csv(
+                    prior_model_file, mesh, active, prop="susceptibilidad",
+                    xy_shift=prior_xy_shift,
+                    z_is_depth=prior_z_is_depth, z_offset=prior_z_offset,
+                    topo_xyz=topo_xyz,
+                    depth_datum=prior_depth_reference, ref_elev=prior_ref_elev,
+                    auto_calibrate=False
+                )
+            except Exception as e:
+                print("[warn] no se pudo leer χ del CSV:", e)
+                m0chi = None
+        if m0chi is None:
+            m0chi = np.zeros(active.sum()) + 0.01
+
+    print(f"[invert_with_options] init density source = {init_source}")
+
+    # 5) Cortes fijos
+    fixed2 = None; fixed4 = None
+    if fixed_slices is not None:
+        if isinstance(fixed_slices, tuple):
+            if len(fixed_slices) == 2: fixed2 = fixed_slices
+            elif len(fixed_slices) == 4: fixed4 = fixed_slices
+            else: raise ValueError("fixed_slices debe ser (Z_CUT, Y_CUT) o (Z_CUT, Y_CUT, depth_top, depth_bottom).")
+        else:
+            raise ValueError("fixed_slices debe ser tupla o None.")
+    if fixed2 is not None and fixed4 is None:
+        zs = mesh.cell_centers_z
+        fixed4 = (float(fixed2[0]), float(fixed2[1]), float(np.max(zs)), float(np.min(zs)))
+    if fixed4 is not None:
+        zc, yc, depth_top, depth_bottom = fixed4
+        def _idx_from_coord(val, axis_vals):
+            if isinstance(val, (int, np.integer)): return int(val)
+            return int(np.argmin(np.abs(axis_vals - float(val))))
+        zi = _idx_from_coord(zc, mesh.cell_centers_z)
+        yi = _idx_from_coord(yc, mesh.cell_centers_y)
+        fixed4 = (zi, yi, float(depth_top), float(depth_bottom))
+
+    out = {"mesh": mesh, "active": active, "rho_init": m0rho, "chi_init": m0chi, "rho_rec": None, "chi_rec": None}
+
+    # 6) Inversiones
+    if INV_IS_GRAV:
+        wires  = maps.Wires(("density", active.sum()))
+        rx_g   = gravity.receivers.Point(xyz_g, components="gz")
+        src_g  = gravity.sources.SourceField([rx_g])
+        survey_g = gravity.survey.Survey(src_g)
+        sim_g  = gravity.simulation.Simulation3DIntegral(
+            mesh=mesh, rhoMap=wires.density, survey=survey_g,
+            active_cells=active, store_sensitivities="disk"
+        )
+        dobj_g = data.Data(survey_g, dobs=gz_obs, standard_deviation=errs_g)
+        dmis_g = data_misfit.L2DataMisfit(data=dobj_g, simulation=sim_g)
+        m_ref   = prior_ref_weight_rho * (m0rho - bg)
+        m_start = np.zeros_like(m0rho)
+        reg_g  = regularization.WeightedLeastSquares(
+            mesh, active_cells=active, mapping=wires.density,
+            alpha_s=1e-3, alpha_x=1e-3, alpha_y=1e-3, alpha_z=1e-3, reference_model=m_ref
+        )
+        opt = optimization.ProjectedGNCG(maxIter=20, lower=-bg, upper=5.0 - bg)
+        dirs = [directives.BetaEstimate_ByEig(beta0_ratio=1.0),
+                directives.BetaSchedule(coolingFactor=3, coolingRate=1.0),
+                directives.Update_IRLS(max_irls_iterations=10, f_min_change=1e-4)]
+        invp = inverse_problem.BaseInvProblem(dmis_g, reg_g, opt)
+        inv  = inversion.BaseInversion(invp, directiveList=dirs)
+
+        mrec    = inv.run(m_start)
+        rho_rec = mrec + bg
+        out["rho_rec"] = rho_rec
+
+        cuts = fixed4 if (fixed4 is not None) else _select_auto_slices(mesh, active, rho_rec, bg=bg)
+        _ = _plot_density_results(mesh, active, m0rho, rho_rec, topo_xyz, xyz_g, zone_props, fixed_slices=cuts, slice_source="recovered")
+        _plot_model_3d(mesh, active, m0rho, rho_rec, label="Densidad (g/cc)", vmin=1.9, vmax=5.0, alpha=0.8, stride=(1,1,1))
+        return out
+
+    elif INV_IS_MAG:
+        # datos magnéticos
+        if mag_grad_files is not None:
+            grad_df = integrate_mag_grad_files(mag_grad_files, utm_crs)
+            xyz_m = grad_df[["X","Y","Z"]].values
+            components = [c for c in (mag_components or ["bxx","byy","bzz"]) if c in grad_df.columns]
+            if len(components) == 0: raise KeyError("No se encontraron componentes válidos (bxx/byy/bzz).")
+            M = np.column_stack([grad_df[c].values.astype(float) for c in components]); dobs_m = M.ravel(order="C")
+            stds = [np.nanstd(grad_df[c].values.astype(float)) for c in components]
+            std_block = np.column_stack([np.ones(len(grad_df))*(s if s>1e-12 else 1.0) for s in stds]).ravel(order="C")
+        else:
+            if mag_grad_file is None: raise ValueError("Para 'mag_gradiometry' pasa mag_grad_file o mag_grad_files=[...]")
+            dfm = pd.read_csv(mag_grad_file).copy()
+            if not {"X","Y"}.issubset(dfm.columns):
+                if not {"Latitud","Longitud"}.issubset(dfm.columns): raise KeyError("mag_grad_file debe tener X,Y o Latitud,Longitud.")
+                tr = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+                X, Y = tr.transform(dfm["Longitud"].astype(float).values, dfm["Latitud"].astype(float).values)
+                dfm["X"], dfm["Y"] = X, Y
+            zcol = next((c for c in dfm.columns if c.strip().lower() in {"z","altura","altura_m","altitude","elev","elevation"}), None)
+            dfm["Z"] = dfm[zcol].astype(float) if zcol else 0.0
+            if "bxx" not in dfm and "dB_E_dE" in dfm: dfm["bxx"] = dfm["dB_E_dE"].astype(float)
+            if "byy" not in dfm and "dB_N_dN" in dfm: dfm["byy"] = dfm["dB_N_dN"].astype(float)
+            if "bzz" not in dfm and "dB_V_dZ" in dfm: dfm["bzz"] = dfm["dB_V_dZ"].astype(float)
+            allowed = ["bxx","bxy","bxz","byy","byz","bzz"]
+            components = [c for c in (mag_components or allowed) if c in dfm.columns and c in allowed]
+            if len(components) == 0: raise KeyError(f"No se encontraron columnas de gradiente en {allowed}.")
+            xyz_m = dfm[["X","Y","Z"]].values
+            M = np.column_stack([dfm[c].values.astype(float) for c in components]); dobs_m = M.ravel(order="C")
+            stds = [np.nanstd(dfm[c].values.astype(float)) for c in components]
+            std_block = np.column_stack([np.ones(len(dfm))*(s if s>1e-12 else 1.0) for s in stds]).ravel(order="C")
+
+        receiver_list = [magnetics.receivers.Point(xyz_m, components=components)]
+        source_field = magnetics.sources.UniformBackgroundField(receiver_list=receiver_list, amplitude=B0, inclination=inc, declination=dec)
+        survey_m = magnetics.survey.Survey(source_field)
+        sim_m = magnetics.simulation.Simulation3DIntegral(
+            mesh=mesh, chiMap=maps.IdentityMap(nP=active.sum()), survey=survey_m, active_cells=active, store_sensitivities="disk"
+        )
+
+        dobj_m = data.Data(survey_m, dobs=dobs_m, standard_deviation=std_block)
+        dmis_m = data_misfit.L2DataMisfit(data=dobj_m, simulation=sim_m)
+        reg_m  = regularization.WeightedLeastSquares(
+            mesh, active_cells=active, mapping=maps.IdentityMap(nP=active.sum()),
+            alpha_s=1e-3, alpha_x=1e-3, alpha_y=1e-3, alpha_z=1e-3, reference_model=m0chi
+        )
+        lower = np.zeros(active.sum()) + 0.0; upper = np.zeros(active.sum()) + 2.0
+        opt = optimization.ProjectedGNCG(maxIter=20, lower=lower, upper=upper)
+        dirs = [directives.BetaEstimate_ByEig(beta0_ratio=1.0),
+                directives.BetaSchedule(coolingFactor=3,coolingRate=1.0),
+                directives.Update_IRLS(max_irls_iterations=10,f_min_change=1e-4)]
+        invp = inverse_problem.BaseInvProblem(dmis_m, reg_m, opt)
+        inv  = inversion.BaseInversion(invp, directiveList=dirs)
+        chi_rec = inv.run(m0chi); out["chi_rec"] = chi_rec
+
+        cuts_chi = fixed4 if (fixed4 is not None) else _select_auto_slices(mesh, active, m0chi, bg=0.0)
+        _ = _plot_scalar_results(mesh, active, m0chi, chi_rec, topo_xyz, label="Susceptibilidad (SI)",
+                                 vmin=None, vmax=None, fixed_slices=cuts_chi, bg=0.0, slice_source="recovered")
+        _plot_model_3d(mesh, active, m0chi, chi_rec, label="Susceptibilidad (SI)", vmin=0.0, vmax=2.0, alpha=0.8, stride=(1,1,1))
+        return out
+
+    elif INV_IS_JOINT:
+        # magnéticos (igual que arriba)
+        if mag_grad_files is not None:
+            grad_df = integrate_mag_grad_files(mag_grad_files, utm_crs)
+            xyz_m = grad_df[["X","Y","Z"]].values
+            components = [c for c in (mag_components or ["bxx","byy","bzz"]) if c in grad_df.columns]
+            if len(components) == 0: raise KeyError("No se encontraron componentes válidos (bxx/byy/bzz).")
+            M = np.column_stack([grad_df[c].values.astype(float) for c in components]); dobs_m = M.ravel(order="C")
+            stds = [np.nanstd(grad_df[c].values.astype(float)) for c in components]
+            std_block = np.column_stack([np.ones(len(grad_df))*(s if s>1e-12 else 1.0) for s in stds]).ravel(order="C")
+        else:
+            if mag_grad_file is None: raise ValueError("Para 'joint' pasa mag_grad_file o mag_grad_files=[...]")
+            dfm = pd.read_csv(mag_grad_file).copy()
+            if not {"X","Y"}.issubset(dfm.columns):
+                if not {"Latitud","Longitud"}.issubset(dfm.columns): raise KeyError("mag_grad_file debe tener X,Y o Latitud,Longitud.")
+                tr = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+                X, Y = tr.transform(dfm["Longitud"].astype(float).values, dfm["Latitud"].astype(float).values)
+                dfm["X"], dfm["Y"] = X, Y
+            zcol = next((c for c in dfm.columns if c.strip().lower() in {"z","altura","altura_m","altitude","elev","elevation"}), None)
+            dfm["Z"] = dfm[zcol].astype(float) if zcol else 0.0
+            if "bxx" not in dfm and "dB_E_dE" in dfm: dfm["bxx"] = dfm["dB_E_dE"].astype(float)
+            if "byy" not in dfm and "dB_N_dN" in dfm: dfm["byy"] = dfm["dB_N_dN"].astype(float)
+            if "bzz" not in dfm and "dB_V_dZ" in dfm: dfm["bzz"] = dfm["dB_V_dZ"].astype(float)
+            allowed = ["bxx","bxy","bxz","byy","byz","bzz"]
+            components = [c for c in (mag_components or allowed) if c in dfm.columns and c in allowed]
+            if len(components) == 0: raise KeyError(f"No se encontraron columnas de gradiente en {allowed}.")
+            xyz_m = dfm[["X","Y","Z"]].values
+            M = np.column_stack([dfm[c].values.astype(float) for c in components]); dobs_m = M.ravel(order="C")
+            stds = [np.nanstd(dfm[c].values.astype(float)) for c in components]
+            std_block = np.column_stack([np.ones(len(dfm))*(s if s>1e-12 else 1.0) for s in stds]).ravel(order="C")
+
+        nA = int(active.sum())
+        wires = maps.Wires(("density", nA), ("chi", nA))
+
+        rx_g   = gravity.receivers.Point(xyz_g, components="gz")
+        src_g  = gravity.sources.SourceField([rx_g])
+        survey_g = gravity.survey.Survey(src_g)
+        sim_g  = gravity.simulation.Simulation3DIntegral(
+            mesh=mesh, rhoMap=wires.density, survey=survey_g, active_cells=active, store_sensitivities="disk",
+        )
+
+        receiver_list = [magnetics.receivers.Point(xyz_m, components=components)]
+        source_field  = magnetics.sources.UniformBackgroundField(receiver_list=receiver_list, amplitude=B0, inclination=inc, declination=dec)
+        survey_m = magnetics.survey.Survey(source_field)
+        sim_m  = magnetics.simulation.Simulation3DIntegral(
+            mesh=mesh, chiMap=wires.chi, survey=survey_m, active_cells=active, store_sensitivities="disk",
+        )
+
+        dobj_g = data.Data(survey_g, dobs=gz_obs, standard_deviation=errs_g)
+        dobj_m = data.Data(survey_m, dobs=dobs_m, standard_deviation=std_block)
+        dmis_g = data_misfit.L2DataMisfit(data=dobj_g, simulation=sim_g)
+        dmis_m = data_misfit.L2DataMisfit(data=dobj_m, simulation=sim_m)
+        dmis   = dmis_g + dmis_m
+
+        mref_rho     = prior_ref_weight_rho * (m0rho - bg)
+        mref_chi     = prior_ref_weight_chi * (m0chi)
+        mref_joint   = np.r_[mref_rho, mref_chi]
+        mstart_joint = np.r_[np.zeros_like(m0rho - bg), np.zeros_like(m0chi)]
+
+        reg_rho = regularization.WeightedLeastSquares(
+            mesh, active_cells=active, mapping=wires.density,
+            alpha_s=1e-3, alpha_x=1e-3, alpha_y=1e-3, alpha_z=1e-3, reference_model=mref_joint
+        )
+        reg_chi = regularization.WeightedLeastSquares(
+            mesh, active_cells=active, mapping=wires.chi,
+            alpha_s=1e-3, alpha_x=1e-3, alpha_y=1e-3, alpha_z=1e-3, reference_model=mref_joint
+        )
+        reg = reg_rho + reg_chi
+
+        lower = np.r_[np.zeros(nA) - bg, np.zeros(nA) + 0.0]
+        upper = np.r_[np.zeros(nA) + 5.0 - bg, np.zeros(nA) + 2.0]
+        opt = optimization.ProjectedGNCG(maxIter=20, lower=lower, upper=upper)
+        dirs = [directives.BetaEstimate_ByEig(beta0_ratio=1.0),
+                directives.BetaSchedule(coolingFactor=3,coolingRate=1.0),
+                directives.Update_IRLS(max_irls_iterations=10,f_min_change=1e-4)]
+        invp = inverse_problem.BaseInvProblem(dmis, reg, opt)
+        inv  = inversion.BaseInversion(invp, directiveList=dirs)
+
+        mrec_joint = inv.run(mstart_joint)
+        wires_out = maps.Wires(("density", nA), ("chi", nA))
+        rho_rec = (wires_out.density * mrec_joint) + bg
+        chi_rec = (wires_out.chi * mrec_joint)
+        out["rho_rec"] = rho_rec; out["chi_rec"] = chi_rec
+
+        cuts_rho = fixed4 if (fixed4 is not None) else _select_auto_slices(mesh, active, m0rho, bg=bg)
+        _ = _plot_density_results(mesh, active, m0rho, rho_rec, topo_xyz, xyz_g, zone_props, fixed_slices=cuts_rho, slice_source="recovered")
+        _plot_model_3d(mesh, active, m0rho, rho_rec, label="Densidad (g/cc)", vmin=1.9, vmax=5.0, alpha=0.8, stride=(1,1,1))
+
+        cuts_chi = cuts_rho if (fixed4 is not None) else _select_auto_slices(mesh, active, m0chi, bg=0.0)
+        _ = _plot_scalar_results(mesh, active, m0chi, chi_rec, topo_xyz, label="Susceptibilidad (SI)",
+                                 vmin=None, vmax=None, fixed_slices=cuts_chi, bg=0.0, slice_source="recovered")
+        _plot_model_3d(mesh, active, m0chi, chi_rec, label="Susceptibilidad (SI)", vmin=0.0, vmax=2.0, alpha=0.8, stride=(1,1,1))
+        return out
+
+    else:
+        raise ValueError("inv_type debe ser 'gravity', 'mag_gradiometry' o 'joint'.")
+
+# =========================
+# CELDA DE CONFIGURACIÓN
+# =========================
+
+BASE = "/content/drive/MyDrive/Tesis"
+
+DEM  = os.path.join(BASE, "DEM_Machin_limite.tif")
+GRAV = os.path.join(BASE, "Gravimetría_VCM.xlsx")
+
+MAG_GRAD_FILES = [
+    os.path.join(BASE, "gradientes_filtrado_1.csv"),
+    os.path.join(BASE, "gradientes_filtrado_2.csv"),
+    os.path.join(BASE, "gradientes_filtrado_3.csv"),
+    os.path.join(BASE, "gradientes_filtrado_4.csv"),
+    os.path.join(BASE, "gradientes_filtrado_5.csv"),
+]
+MAG_GRAD_FILE  = None
+MAG_COMPONENTS = None
+
+shapefiles = {
+    "unidades": os.path.join(BASE, "unidades_sin_flujos.shp"),
+    "flujos"  : os.path.join(BASE, "flujos_sin_recortes.shp"),
+    "crater"  : os.path.join(BASE, "crater_fixed.shp"),
+    "domo"    : os.path.join(BASE, "domo_fixed.shp"),
+}
+
+zone_props = {
+    "background": 2.9,
+    "unidades"  : {"dens": 2.9},
+    "flujos"    : {"dens": 1.8},
+    "crater"    : {"dens": 1.95},
+    "domo"      : {"dens": 2.5},
+    "under_dome": {"dens": 1.9},
+}
+
+# Cortes fijos (compartidos)
+USE_FIXED_CUTS = True
+Z_CUT = 1575.0
+Y_CUT = 496105.1
+FIXED_SLICES = (Z_CUT, Y_CUT)
+
+# Campo magnético
+B0, INC, DEC = 30055.6, 26.78927, -7.63654
+
+# Modelo previo (toggle)
+USE_PRIOR = False
+if USE_PRIOR:
+    SYN_MODELS_DIR = os.path.join(BASE, "Sinteticos")
+    PRIOR_MODEL    = os.path.join(SYN_MODELS_DIR, "falla_normal", "modelo_mesh.csv")
+else:
+    PRIOR_MODEL    = None
+
+# Pesos de referencia
+PRIOR_REF_WEIGHT_RHO = 0.30
+PRIOR_REF_WEIGHT_CHI = 0.30
+
+# Alineación del PREVIO
+PRIOR_SRC_CRS         = None
+PRIOR_ROT_DEG         = 0.0
+PRIOR_XY_SHIFT        = (0.0, 0.0)
+PRIOR_Z_IS_DEPTH      = True
+PRIOR_Z_OFFSET        = 0.0
+PRIOR_DEPTH_REFERENCE = "flat"
+PRIOR_REF_ELEV        = 1800
+
+ESTIMAR_SHIFT_AUTO = True
+if USE_PRIOR and (PRIOR_MODEL is not None) and os.path.isfile(PRIOR_MODEL) and ESTIMAR_SHIFT_AUTO:
+    if PRIOR_SRC_CRS is None:
+        PRIOR_ROT_DEG, PRIOR_XY_SHIFT = auto_align_prior_xy(PRIOR_MODEL, DEM, GRAV)
+    else:
+        PRIOR_ROT_DEG, PRIOR_XY_SHIFT = auto_align_prior_xy(PRIOR_MODEL, DEM, GRAV, src_crs=PRIOR_SRC_CRS)
+
+print("USE_PRIOR        :", USE_PRIOR)
+print("PRIOR_MODEL      :", PRIOR_MODEL)
+print("PRIOR_SRC_CRS    :", PRIOR_SRC_CRS)
+print("PRIOR_ROT_DEG    :", PRIOR_ROT_DEG)
+print("PRIOR_XY_SHIFT   :", PRIOR_XY_SHIFT)
+print("PRIOR_Z_IS_DEPTH :", PRIOR_Z_IS_DEPTH)
+print("PRIOR_Z_OFFSET   :", PRIOR_Z_OFFSET)
+print("FIXED_SLICES     :", FIXED_SLICES if USE_FIXED_CUTS else None)
+
+# === GRAVITY ===
+rho_src = "prior" if USE_PRIOR else "shapes"
+res_grav = invert_with_options(
+    dem_file=DEM, grav_file=GRAV, shapefiles=shapefiles, zone_props=zone_props,
+    dh=150., nz=40, z_top=3000., inv_type="gravity",
+    prior_model_file=(PRIOR_MODEL if USE_PRIOR else None),
+    prior_model_property="densidad",
+    prior_depth_reference=PRIOR_DEPTH_REFERENCE,
+    prior_ref_elev=PRIOR_REF_ELEV,
+    fixed_slices=(FIXED_SLICES if USE_FIXED_CUTS else None),
+    rho_init_source=rho_src
+)
+
+# === MAG_GRADIOMETRY ===
+res_mag = invert_with_options(
+    dem_file=DEM, grav_file=GRAV, shapefiles=shapefiles, zone_props=zone_props,
+    dh=150., nz=40, z_top=3000., inv_type="mag_gradiometry",
+    prior_model_file=(PRIOR_MODEL if USE_PRIOR else None),
+    prior_model_property="susceptibilidad",
+    prior_depth_reference=PRIOR_DEPTH_REFERENCE,
+    prior_ref_elev=PRIOR_REF_ELEV,
+    mag_grad_file=MAG_GRAD_FILE,
+    mag_grad_files=MAG_GRAD_FILES,
+    mag_components=MAG_COMPONENTS,
+    B0=B0, inc=INC, dec=DEC,
+    fixed_slices=(FIXED_SLICES if USE_FIXED_CUTS else None),
+    rho_init_source="background"
+)
+
+# === JOINT ===
+res_joint = invert_with_options(
+    dem_file=DEM, grav_file=GRAV, shapefiles=shapefiles, zone_props=zone_props,
+    dh=150., nz=40, z_top=3000., inv_type="joint",
+    prior_model_file=(PRIOR_MODEL if USE_PRIOR else None),
+    prior_model_property=("both" if USE_PRIOR else "densidad"),
+    prior_depth_reference=PRIOR_DEPTH_REFERENCE,
+    prior_ref_elev=PRIOR_REF_ELEV,
+    mag_grad_file=MAG_GRAD_FILE,
+    mag_grad_files=MAG_GRAD_FILES,
+    mag_components=MAG_COMPONENTS,
+    B0=B0, inc=INC, dec=DEC,
+    fixed_slices=(FIXED_SLICES if USE_FIXED_CUTS else None),
+    rho_init_source=("prior" if USE_PRIOR else "shapes")
+)
