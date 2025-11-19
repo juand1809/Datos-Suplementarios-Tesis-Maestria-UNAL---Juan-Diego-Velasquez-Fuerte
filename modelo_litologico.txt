@@ -1,0 +1,204 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib import colors
+import json
+import re
+from discretize import TensorMesh
+from pyproj import Transformer
+import matplotlib.patches as mpatches
+from scipy.spatial import cKDTree
+
+def parse_meta_from_csv(file_path):
+    """
+    Lee la primera línea de un archivo CSV para extraer metadatos JSON.
+    """
+    with open(file_path, 'r') as f:
+        first_line = f.readline()
+    
+    match = re.search(r'#\s*META_JSON\s*=\s*({.*})', first_line)
+    if not match:
+        raise ValueError("No se encontró la cabecera META_JSON en el archivo.")
+        
+    try:
+        meta = json.loads(match.group(1))
+        return meta
+    except json.JSONDecodeError as e:
+        print(f"Error decodificando JSON: {e}")
+        raise
+
+def create_mesh_from_data(df, meta):
+    """
+    Crea una instancia de discretize.TensorMesh a partir de los datos y metadatos.
+    """
+    x_res, y_res = 50, 50 # Resolución de 50x50 metros
+    print(f"Usando resolución fija: x_res={x_res}m, y_res={y_res}m")
+
+    try:
+        nk = meta['grid_shape']['nk']
+        dz = meta['dz_m']
+    except KeyError as e:
+        raise KeyError(f"Falta una clave esperada en los metadatos: {e}")
+
+    # Calcular el bounding box de los datos
+    x_min_data, x_max_data = df['utm_x'].min(), df['utm_x'].max()
+    y_min_data, y_max_data = df['utm_y'].min(), df['utm_y'].max()
+    z_min_data, z_max_data = df['top_elev_m'].min(), df['top_elev_m'].max()
+
+    # Añadir un padding
+    padding_x = x_res * 2
+    padding_y = y_res * 2
+    padding_z = dz * 2
+
+    # Calcular el nuevo origen de la malla
+    x0 = x_min_data - padding_x
+    y0 = y_min_data - padding_y
+    z0 = z_min_data - padding_z
+    nk_new = int(np.ceil((z_max_data - z_min_data + 2 * padding_z) / dz))
+    W = int(np.ceil((x_max_data - x_min_data + 2 * padding_x) / x_res))
+    H = int(np.ceil((y_max_data - y_min_data + 2 * padding_y) / y_res))
+
+    print("\n--- Geometría de Malla Auto-Ajustada ---")
+    print(f"Origen de malla calculado: (X: {x0:.2f}, Y: {y0:.2f}, Z: {z0:.2f})")
+    print(f"Dimensiones de malla (celdas): (W: {W}, H: {H}, nk: {nk_new})")
+    print("----------------------------------------\n")
+
+    # Crear los vectores de celdas
+    hx = np.ones(W) * x_res
+    hy = np.ones(H) * y_res
+    hz = np.ones(nk_new) * dz
+    
+    mesh = TensorMesh([hx, hy, hz], x0=(x0, y0, z0))
+    return mesh
+
+def build_and_interpolate_model(file_path):
+    """
+    Construye e interpola un modelo 3D a partir de datos de puntos.
+    """
+    print(f"Leyendo metadatos y datos desde: {file_path}")
+    meta = parse_meta_from_csv(file_path)
+    df = pd.read_csv(file_path, comment='#')
+
+    # --- 1. Transformación de Coordenadas ---
+    print("\n--- Transformando Coordenadas de Lon/Lat a UTM Zone 18N ---")
+    try:
+        transformer = Transformer.from_crs("epsg:4326", "epsg:32618", always_xy=True)
+        df['utm_x'], df['utm_y'] = transformer.transform(df['x_easting_m'].values, df['y_northing_m'].values)
+        print("Coordenadas transformadas exitosamente.")
+    except Exception as e:
+        print(f"ADVERTENCIA: Falló la transformación de coordenadas: {e}")
+        return None, None, None, None, None
+    
+    # --- 2. Creación de la Malla ---
+    mesh = create_mesh_from_data(df, meta)
+    
+    # --- 3. Población Inicial del Modelo (Puntos Originales) ---
+    print("\nPoblando la malla con los datos de puntos originales...")
+    unit_names = sorted(df['unit'].unique())
+    unit_map = {name: i for i, name in enumerate(unit_names)}
+    
+    # Crear modelo inicial solo con los puntos de datos
+    initial_model = np.full(mesh.n_cells, np.nan)
+    points = df[['utm_x', 'utm_y', 'top_elev_m']].values
+    
+    ix = np.searchsorted(mesh.nodes_x, points[:, 0]) - 1
+    iy = np.searchsorted(mesh.nodes_y, points[:, 1]) - 1
+    iz = np.searchsorted(mesh.nodes_z, points[:, 2]) - 1
+
+    valid_mask = (
+        (ix >= 0) & (ix < mesh.shape_cells[0]) &
+        (iy >= 0) & (iy < mesh.shape_cells[1]) &
+        (iz >= 0) & (iz < mesh.shape_cells[2])
+    )
+    
+    points_in_mesh_df = df[valid_mask]
+    flat_cell_indices = np.ravel_multi_index(
+        (ix[valid_mask], iy[valid_mask], iz[valid_mask]),
+        mesh.shape_cells
+    )
+    
+    initial_model[flat_cell_indices] = points_in_mesh_df['unit'].map(unit_map).values
+    num_filled = len(np.unique(flat_cell_indices))
+    print(f"Diagnóstico: Se poblaron {num_filled} celdas únicas con los datos originales.")
+
+    # --- 4. Interpolación del Modelo (Rellenar Huecos) ---
+    print("\nInterpolando el modelo para rellenar los espacios vacíos (Nearest Neighbor)...")
+    
+    # Coordenadas de los centros de celda con datos y de las celdas vacías
+    active_cells = ~np.isnan(initial_model)
+    empty_cells = np.isnan(initial_model)
+    
+    # Construir un árbol KD para búsqueda rápida de vecinos cercanos
+    tree = cKDTree(mesh.cell_centers[active_cells])
+    
+    # Encontrar el vecino más cercano para cada celda vacía
+    dist, inds = tree.query(mesh.cell_centers[empty_cells], k=1)
+    
+    # Rellenar el modelo
+    interpolated_model = np.copy(initial_model)
+    interpolated_model[empty_cells] = initial_model[active_cells][inds]
+    
+    print("Interpolación completada. El modelo ahora es sólido.")
+    
+    return mesh, interpolated_model, unit_map
+
+def plot_interpolated_slice(mesh, model, unit_map, view='y', slice_index=None, title="Corte del Modelo Interpolado"):
+    """
+    Visualiza un corte 2D de un modelo 3D interpolado con una leyenda categórica.
+    """
+    if slice_index is None:
+        slice_index = mesh.shape_cells[1] // 2 # Corte por el medio del eje Y por defecto
+
+    fig, ax = plt.subplots(figsize=(14, 8))
+    
+    unit_cmap = plt.get_cmap('viridis', len(unit_map))
+    norm = colors.BoundaryNorm(np.arange(len(unit_map) + 1) - 0.5, len(unit_map))
+    
+    mesh.plot_slice(
+        model,
+        ax=ax,
+        normal=view.upper(),
+        ind=slice_index,
+        grid=False,
+        pcolor_opts={'cmap': unit_cmap, 'norm': norm}
+    )
+    
+    ax.set_title(f"{title} (Corte en {view.upper()} en el índice {slice_index})")
+    ax.set_aspect('equal')
+    
+    # --- Creación de Leyenda Categórica ---
+    legend_patches = []
+    for unit_name, unit_number in unit_map.items():
+        color = unit_cmap(norm(np.array([unit_number])))[0]
+        patch = mpatches.Patch(color=color, label=unit_name)
+        legend_patches.append(patch)
+    ax.legend(handles=legend_patches, bbox_to_anchor=(1.05, 1), loc='upper left')
+    # --- Fin de Leyenda Categórica ---
+    
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == '__main__':
+    # Nombre del archivo que contiene el modelo
+    BUNDLE_FILE = 'cerro_machin_model_bundle.csv'
+
+    try:
+        # 1. Construir e interpolar el modelo desde el archivo
+        # Nota: Solo se interpola el modelo de unidades geológicas para este ejemplo
+        mesh, unit_model_interpolated, unit_map = build_and_interpolate_model(BUNDLE_FILE)
+
+        if mesh is not None:
+            # 2. Visualizar un corte del modelo de unidades geológicas interpolado
+            plot_interpolated_slice(
+                mesh,
+                unit_model_interpolated,
+                unit_map,
+                view='y',
+                title="Modelo de Unidades Geológicas Interpolado"
+            )
+
+    except FileNotFoundError:
+        print(f"Error: No se encontró el archivo '{BUNDLE_FILE}'. Asegúrate de que esté en el mismo directorio.")
+    except Exception as e:
+        print(f"Ocurrió un error inesperado: {e}")
