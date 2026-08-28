@@ -1,0 +1,1780 @@
+# -*- coding: utf-8 -*-
+# Inversión: gravity | mag_gradiometry (bxx..bzz) | joint (gravity + mag_gradiometry)
+
+import os
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import rasterio
+from rasterio.warp import calculate_default_transform, reproject
+from rasterio.enums import Resampling
+from pyproj import Transformer
+from discretize import TensorMesh
+from discretize.utils import active_from_xyz
+from scipy.spatial import cKDTree
+from simpeg import maps, data, data_misfit, regularization, optimization, inverse_problem, directives, inversion
+from simpeg.potential_fields import gravity, magnetics
+import matplotlib.pyplot as plt
+from matplotlib.ticker import ScalarFormatter
+from matplotlib import cm, colors
+import re
+
+try:
+    from shapely import contains_xy as _contains_xy
+except Exception:
+    from shapely.vectorized import contains as _contains_xy
+
+# ====== Constantes ======
+XG_MU   = 1e10    # peso cross-gradient
+RHO_MIN = 1.0     # g/cc
+RHO_MAX = 5.0     # g/cc
+CHI_MIN = -2.50   # SI
+CHI_MAX = 2.50    # SI
+# Escala visual bonita para susceptibilidad (solo figuras, NO inversión)
+CHI_PLOT_MIN = -0.18  # SI
+CHI_PLOT_MAX = 0.06   # SI
+
+# Ajuste para que la gradiometría no salga tan parchada
+# OJO: estos límites son para la INVERSIÓN de chi en MAG_GRADIOMETRY.
+# La escala visual 2D sigue usando CHI_PLOT_MIN / CHI_PLOT_MAX.
+MAG_CHI_LOWER = -0.18
+MAG_CHI_UPPER = 0.08
+
+MAG_ALPHA_S_CHI = 1.0
+MAG_ALPHA_X_CHI = 8.0
+MAG_ALPHA_Y_CHI = 8.0
+MAG_ALPHA_Z_CHI = 12.0
+
+# Aumenta un poco la incertidumbre efectiva de los gradientes
+# para evitar que la inversión sobreajuste ruido/localidades.
+MAG_DATA_STD_FACTOR = 2.0
+
+# Ajuste SOLO para la inversión simultánea / joint v3.
+# La idea es que la simultánea no destruya lo que ya funciona en las individuales.
+#
+# Estrategia:
+# - Mantener la inversión simultánea como gravity + mag_gradiometry.
+# - Apagar cross-gradient por defecto para que no fuerce parches compartidos.
+# - Usar el modelo inicial como modelo de referencia en joint.
+# - Suavizar rho y chi sin cambiar las inversiones individuales.
+JOINT_USE_CROSS_GRADIENT = False
+JOINT_XG_MU = 0.0
+
+# Peso efectivo de datos dentro de joint.
+# Sube un poco las incertidumbres solo en la simultánea para evitar sobreajuste.
+JOINT_GRAV_DATA_STD_FACTOR = 3.0  # GRAVIMETRÍA/ρ REVERTIDA: deshace v6/v7
+JOINT_MAG_DATA_STD_FACTOR = 8.0
+
+# Regularización de densidad SOLO en joint.
+JOINT_ALPHA_S_RHO = 0.5
+JOINT_ALPHA_X_RHO = 4.0
+JOINT_ALPHA_Y_RHO = 4.0
+JOINT_ALPHA_Z_RHO = 8.0
+
+# Regularización de susceptibilidad SOLO en joint.
+JOINT_ALPHA_S_CHI = 3.0
+JOINT_ALPHA_X_CHI = 20.0
+JOINT_ALPHA_Y_CHI = 20.0
+JOINT_ALPHA_Z_CHI = 24.0
+
+# Bounds de chi en joint: mismo rango suave de mag_gradiometry individual.
+JOINT_CHI_LOWER = -0.08
+JOINT_CHI_UPPER = 0.04
+
+# Bounds de rho en joint: conservadores, pero sin cambiar los límites globales.
+JOINT_RHO_LOWER = RHO_MIN
+JOINT_RHO_UPPER = RHO_MAX
+
+# Beta para joint: más alta y enfriamiento más lento para evitar parches.
+JOINT_BETA0_RATIO = 80.0
+JOINT_BETA_COOLING_FACTOR = 2.5
+
+# Mapas de ajuste de datos: observado / predicho / residual
+# No cambian la inversión; solo grafican y guardan el ajuste final.
+PLOT_MISFIT = True
+SAVE_MISFIT = True
+
+def _union_all(geo):
+    gs = getattr(geo, "geometry", geo)
+    ua = getattr(gs, "union_all", None)
+    return ua() if callable(ua) else gs.unary_union
+
+def auto_y_cut_from_shape(dem_file, shape_path):
+    _, _, dst_crs = read_dem(dem_file)
+    gdf = gpd.read_file(shape_path).to_crs(dst_crs)
+    geom = getattr(gdf, "geometry", gdf)
+    union = getattr(geom, "union_all", None)
+    poly = union() if callable(union) else geom.unary_union
+    return float(poly.centroid.y)
+
+def integrate_mag_grad_files(mag_grad_files, utm_crs):
+    ALT_ALIASES = [r"^Z$", r"^Altura$", r"^Altura_?m$", r"^Altitude$", r"^Elev(ation)?$", r"^altura$"]
+    def _pick_alt_col(df):
+        for c in df.columns:
+            if any(re.fullmatch(p, c.strip()) for p in ALT_ALIASES):
+                return c
+        return None
+
+    utm_str = utm_crs if isinstance(utm_crs, str) else utm_crs.to_string()
+    tr = Transformer.from_crs("EPSG:4326", utm_str, always_xy=True)
+
+    frames = []
+    for i, path in enumerate(mag_grad_files, 1):
+        df = pd.read_csv(path).copy()
+        df["line_id"] = i
+
+        if {"X","Y"}.issubset(df.columns):
+            X = df["X"].astype(float).values
+            Y = df["Y"].astype(float).values
+        else:
+            if not {"Latitud","Longitud"}.issubset(df.columns):
+                raise KeyError(f"{path} debe tener X,Y o Latitud,Longitud")
+            X, Y = tr.transform(
+                df["Longitud"].astype(float).values,
+                df["Latitud"].astype(float).values
+            )
+
+        alt_col = _pick_alt_col(df)
+        Z = df[alt_col].astype(float).values if alt_col else np.zeros(len(df))
+
+        bxx = (df["bxx"] if "bxx" in df.columns else df["dB_E_dE"]).astype(float).values
+        byy = (df["byy"] if "byy" in df.columns else df["dB_N_dN"]).astype(float).values
+        bzz = (df["bzz"] if "bzz" in df.columns else df["dB_V_dZ"]).astype(float).values
+
+        frames.append(pd.DataFrame({"X":X,"Y":Y,"Z":Z,"bxx":bxx,"byy":byy,"bzz":bzz,"line_id":df["line_id"]}))
+
+    out = pd.concat(frames, ignore_index=True)
+    return out[["X","Y","Z","bxx","byy","bzz","line_id"]]
+
+def read_dem(dem_file):
+    with rasterio.open(dem_file) as src:
+        if src.crs.is_geographic:
+            dst_crs = "EPSG:32618"
+            transform, w, h = calculate_default_transform(
+                src.crs, dst_crs, src.width, src.height, *src.bounds
+            )
+            topo = np.empty((h, w), dtype=np.float32)
+            reproject(
+                source=src.read(1), destination=topo,
+                src_transform=src.transform, src_crs=src.crs,
+                dst_transform=transform, dst_crs=dst_crs,
+                resampling=Resampling.bilinear
+            )
+        else:
+            topo = src.read(1)
+            transform = src.transform
+            dst_crs = src.crs
+
+    rows, cols = np.indices(topo.shape)
+    xs, ys = rasterio.transform.xy(transform, rows, cols, offset="center")
+    topo_xyz = np.column_stack([np.array(xs).ravel(),
+                                np.array(ys).ravel(),
+                                topo.ravel()])
+    return topo, topo_xyz, dst_crs
+
+def build_mesh_and_active(xyz, topo_xyz, dh=150., nz=40, z_top=3000., pad=0.):
+    x0, x1 = xyz[:,0].min()-pad, xyz[:,0].max()+pad
+    y0, y1 = xyz[:,1].min()-pad, xyz[:,1].max()+pad
+    nx = int(np.ceil((x1-x0)/dh))
+    ny = int(np.ceil((y1-y0)/dh))
+    z0 = z_top - dh*nz
+    mesh = TensorMesh([[dh]*nx, [dh]*ny, [dh]*nz], x0=[x0, y0, z0])
+    active = active_from_xyz(mesh, topo_xyz)
+    return mesh, active
+
+def load_prior_model_csv(
+    csv_file, mesh, active,
+    prop="densidad", xcol="X", ycol="Y", zcol="Z",
+    xy_shift=None,
+    z_is_depth=False,
+    z_offset=0.0,
+    topo_xyz=None,
+    auto_calibrate=True,
+    sample=20000,
+    depth_datum="topo",
+    ref_elev="auto",
+    depth_offset_scan=300.0
+):
+    print("[load_prior_model_csv] v6 (depth-datum: topo|flat)")
+    df = pd.read_csv(csv_file)
+
+    prop_alias = {
+        "densidad": [
+            "densidad","density","dens","rho","rho_gcc","dens_gcc",
+            "densidad_gcc","rho_(g/cc)","rho_g/cc"
+        ],
+        "susceptibilidad": [
+            "susceptibilidad","susceptibility","chi","k","kappa",
+            "susc","susc_si","sus_si","susceptibilidad_si","suscept_(si)"
+        ]
+    }
+    key = "densidad" if prop.lower().startswith("dens") else "susceptibilidad"
+
+    cols_original = list(df.columns)
+    cols_lower = [c.strip().lower() for c in cols_original]
+
+    target = None
+    for alias in prop_alias[key]:
+        if alias in cols_lower:
+            target = cols_original[cols_lower.index(alias)]
+            break
+    if target is None:
+        import re as _re
+        patt = _re.compile(r"(dens|rho)" if key=="densidad"
+                           else r"(susc|suscep|chi|kappa|(^|\W)k($|\W))", _re.I)
+        candidates = [c for c in cols_original if patt.search(c)]
+        if candidates:
+            vari = [(c, float(np.nanvar(pd.to_numeric(df[c], errors="coerce")))) for c in candidates]
+            vari.sort(key=lambda x: x[1], reverse=True)
+            target = vari[0][0]
+    if target is None:
+        raise KeyError(
+            f"No se encontró columna de '{key}' en {csv_file}.\n"
+            f"Columnas disponibles: {cols_original}"
+        )
+    print(f"[load_prior_model_csv] usando columna '{target}' para {key}")
+
+    if not {xcol, ycol, zcol}.issubset(df.columns):
+        raise KeyError(f"El CSV debe tener columnas {xcol},{ycol},{zcol}")
+
+    pts = df[[xcol, ycol, zcol]].astype(float).values
+    Zraw = pts[:, 2].copy()
+    if xy_shift is not None:
+        dx, dy = float(xy_shift[0]), float(xy_shift[1])
+        pts[:, 0] += dx
+        pts[:, 1] += dy
+
+    vals = pd.to_numeric(df[target], errors="coerce").astype(float).values
+    if topo_xyz is None:
+        raise ValueError("Se requiere 'topo_xyz' para tratar Z correctamente.")
+
+    topo_tree2 = cKDTree(topo_xyz[:, :2])
+    idx_topo = topo_tree2.query(pts[:, :2], k=1)[1]
+    tz_all = topo_xyz[idx_topo, 2]
+
+    CC_act = mesh.gridCC[active]
+    CC_tree3 = cKDTree(CC_act)
+
+    auto_mode   = (isinstance(z_is_depth, str) and z_is_depth.lower() in ("auto","detect")) or (z_is_depth is None)
+    auto_offset = (isinstance(z_offset,   str) and z_offset.lower()   in ("auto","detect"))
+
+    if auto_calibrate and (auto_mode or auto_offset):
+        n = len(pts)
+        take = np.arange(n) if n <= sample else np.random.default_rng(12345).choice(n, size=sample, replace=False)
+        Xs, Ys = pts[take, 0].copy(), pts[take, 1].copy()
+        Zraw_s = Zraw[take].copy()
+        tz_s   = tz_all[take].copy()
+
+        if str(depth_datum).lower() == "flat":
+            if isinstance(ref_elev, (int, float)):
+                Z_REF = float(ref_elev)
+            else:
+                Z_REF = float(np.nanmedian(tz_s))
+            print(f"[autoZ] datum='flat'  Z_REF={Z_REF:.2f} m")
+        else:
+            Z_REF = None
+
+        def score_for(mode, offset):
+            if mode == "depth":
+                if str(depth_datum).lower() == "flat":
+                    Ze = Z_REF - Zraw_s + offset
+                else:
+                    Ze = tz_s  - Zraw_s + offset
+            else:
+                Ze = Zraw_s + offset
+            Q = np.column_stack([Xs, Ys, Ze])
+            _, idxN = CC_tree3.query(Q, k=1)
+            dz = np.abs(CC_act[idxN, 2] - Ze)
+            return float(np.median(dz)), float(np.percentile(dz, 95)), float(np.max(dz))
+
+        offsets_depth = np.linspace(-abs(depth_offset_scan), abs(depth_offset_scan), 25)
+        offsets_elev  = np.linspace(-5000.0, 5000.0, 51)
+
+        modes_to_try = ["depth","elev"] if auto_mode else (["depth"] if bool(z_is_depth) else ["elev"])
+        best = {"mode": None, "offset": 0.0, "med": np.inf, "p95": np.inf, "max": np.inf}
+
+        for mode in modes_to_try:
+            test_offsets = offsets_depth if (auto_offset and mode=="depth") else (
+                           offsets_elev  if  auto_offset else [float(z_offset)])
+            for off in test_offsets:
+                med, p95, mx = score_for(mode, off)
+                if med < best["med"]:
+                    best.update({"mode": mode, "offset": float(off), "med": med, "p95": p95, "max": mx})
+
+        z_is_depth = (best["mode"] == "depth") if auto_mode else bool(z_is_depth)
+        z_offset   = float(best["offset"])     if auto_offset else float(z_offset)
+
+        print(f"[autoZ] modo={best['mode']}  offset={best['offset']:.1f} m  "
+              f"|ΔZ| p50={best['med']:.1f}  p95={best['p95']:.1f}  max={best['max']:.1f} m")
+
+    dd = str(depth_datum).lower()
+    if bool(z_is_depth):
+        if dd == "flat":
+            if isinstance(ref_elev, (int, float)):
+                Z_REF = float(ref_elev)
+            else:
+                Z_REF = float(np.nanmedian(tz_all))
+            pts[:, 2] = Z_REF - Zraw + float(z_offset)
+        else:
+            pts[:, 2] = tz_all - Zraw + float(z_offset)
+    else:
+        pts[:, 2] = Zraw + float(z_offset)
+
+    tree_csv = cKDTree(pts)
+    d3, idxN = tree_csv.query(CC_act, k=1)
+    med = float(np.median(d3)); p95 = float(np.percentile(d3, 95)); mx = float(np.max(d3))
+    print(f"[NN CSV→mesh] d3 median={med:.1f} m  p95={p95:.1f} m  max={mx:.1f} m "
+          f"(z_is_depth={bool(z_is_depth)}, z_offset={float(z_offset):.1f}, datum={depth_datum})")
+
+    return vals[idxN].astype(float)
+
+def estimate_prior_xy_shift(prior_csv, dem_file, grav_file, src_crs=None, sample=20000):
+    _, _, utm_crs = read_dem(dem_file)
+    utm_str = utm_crs if isinstance(utm_crs, str) else utm_crs.to_string()
+
+    ext = os.path.splitext(grav_file)[1].lower()
+    if ext in (".xls", ".xlsx"):
+        df0 = pd.read_excel(grav_file)
+        df = df0.rename(columns={"Lat (°)":"Lat","Long (°)":"Lon",
+                                 "Height (m)":"Z","ΔB (mGal)":"gz"})
+        tf = Transformer.from_crs("EPSG:4326", utm_str, always_xy=True)
+        df["X"], df["Y"] = tf.transform(df.Lon.values, df.Lat.values)
+    else:
+        df = pd.read_csv(grav_file)
+    xyz_g = df[["X","Y","Z"]].values
+
+    topo_xyz = read_dem(dem_file)[1]
+    mesh_tmp, active_tmp = build_mesh_and_active(xyz_g, topo_xyz, dh=150., nz=40, z_top=3000.)
+    CC = mesh_tmp.gridCC[active_tmp][:, :2]
+
+    dfp = pd.read_csv(prior_csv)
+    if {"X","Y"}.issubset(dfp.columns):
+        PX = dfp["X"].astype(float).values
+        PY = dfp["Y"].astype(float).values
+    elif {"Longitud","Latitud"}.issubset(dfp.columns) and src_crs is not None:
+        tr = Transformer.from_crs(src_crs, utm_str, always_xy=True)
+        PX, PY = tr.transform(dfp["Longitud"].astype(float).values,
+                              dfp["Latitud"].astype(float).values)
+    else:
+        raise ValueError("El CSV debe tener X,Y o (Longitud,Latitud)+src_crs.")
+    P = np.column_stack([PX, PY])
+
+    shift0 = CC.mean(axis=0) - P.mean(axis=0)
+    P1 = P + shift0
+
+    if len(P1) > sample:
+        rng = np.random.default_rng(1234)
+        take = rng.choice(len(P1), size=sample, replace=False)
+        P1s = P1[take]
+    else:
+        P1s = P1
+    idx = cKDTree(CC).query(P1s, k=1)[1]
+    deltas = CC[idx] - P1s
+    shift_ref = np.median(deltas, axis=0)
+    shift = shift0 + shift_ref
+
+    P2 = P + shift
+    dNN = cKDTree(CC).query(P2, k=1)[0]
+    p50, p95, dmax = np.percentile(dNN, [50, 95, 100])
+    print(f"[SUGERENCIA SHIFT] dXY percentiles -> p50={p50:.1f} m  p95={p95:.1f} m  max={dmax:.1f} m")
+    print(f"Sugiero poner: PRIOR_XY_SHIFT = ({shift[0]:.4f}, {shift[1]:.4f})")
+    return (float(shift[0]), float(shift[1]))
+
+def auto_align_prior_xy(prior_csv, dem_file, grav_file, src_crs=None,
+                        dh=150., nz=40, z_top=3000.):
+    """
+    Estima ROTACIÓN (grados) + SHIFT (dx,dy) para alinear el CSV del modelo previo
+    con la malla armada desde tus estaciones de gravedad (CRS del DEM).
+    Devuelve: (rot_deg, (dx, dy))
+    Imprime percentiles de distancia NN tras la alineación.
+    """
+    # --- 1) CRS y malla como en tu flujo principal ---
+    topo, topo_xyz, utm_crs = read_dem(dem_file)
+    utm_str = utm_crs if isinstance(utm_crs, str) else utm_crs.to_string()
+
+    # Grav -> UTM (igual que haces en la inversión)
+    ext = os.path.splitext(grav_file)[1].lower()
+    if ext in (".xls", ".xlsx"):
+        df0 = pd.read_excel(grav_file)
+        df = df0.rename(columns={"Lat (°)":"Lat","Long (°)":"Lon",
+                                 "Height (m)":"Z","ΔB (mGal)":"gz"})
+        tf = Transformer.from_crs("EPSG:4326", utm_str, always_xy=True)
+        df["X"], df["Y"] = tf.transform(df.Lon.values, df.Lat.values)
+    else:
+        df = pd.read_csv(grav_file)
+    xyz_g = df[["X","Y","Z"]].values
+
+    mesh, active = build_mesh_and_active(xyz_g, topo_xyz, dh=dh, nz=nz, z_top=z_top)
+    CC = mesh.gridCC[active][:, :2]  # centros activos (X,Y)
+
+    # --- 2) Lee XY del CSV del previo y (si hace falta) reproyecta ---
+    d = pd.read_csv(prior_csv)
+    if {"X","Y"}.issubset(d.columns):
+        P = d[["X","Y"]].astype(float).values
+    elif {"Longitud","Latitud"}.issubset(d.columns) and (src_crs is not None):
+        tr = Transformer.from_crs(src_crs, utm_str, always_xy=True)
+        X, Y = tr.transform(d["Longitud"].astype(float).values,
+                            d["Latitud"].astype(float).values)
+        P = np.column_stack([X, Y])
+    else:
+        raise ValueError("El CSV debe tener X,Y o (Longitud,Latitud)+src_crs.")
+
+    # --- 3) Prueba de rotaciones pequeñas y elige la mejor por mediana NN ---
+    def _rot2d(xy, deg, center):
+        th = np.deg2rad(deg)
+        c, s = np.cos(th), np.sin(th)
+        R = np.array([[c, -s],[s, c]])
+        return (xy - center) @ R.T + center
+
+    rot_list = [-10, -5, -2, -1, 0, 1, 2, 5, 10]
+    Cc = P.mean(axis=0)
+
+    treeCC = cKDTree(CC)
+    best = {"score": np.inf, "rot": 0.0, "shift": (0.0, 0.0), "med": np.inf, "p95": np.inf, "max": np.inf}
+
+    for rot in rot_list:
+        P_rot = _rot2d(P, rot, center=Cc)
+
+        # shift por centroides
+        shift0 = CC.mean(axis=0) - P_rot.mean(axis=0)
+        P1 = P_rot + shift0
+
+        # refinamiento por mediana NN
+        idx = treeCC.query(P1, k=1)[1]
+        deltas = CC[idx] - P1
+        shift_ref = np.median(deltas, axis=0)
+        shift = shift0 + shift_ref
+
+        # calidad
+        P2 = P_rot + shift
+        dNN = treeCC.query(P2, k=1)[0]
+        med = float(np.median(dNN))
+        p95 = float(np.percentile(dNN, 95))
+        dmx = float(np.max(dNN))
+        score = med
+
+        if score < best["score"]:
+            best = {"score": score, "rot": float(rot), "shift": (float(shift[0]), float(shift[1])),
+                    "med": med, "p95": p95, "max": dmx}
+
+    print(f"[auto_align_prior_xy] Mejor rot={best['rot']}°  shift=({best['shift'][0]:.4f}, {best['shift'][1]:.4f})")
+    print(f"[auto_align_prior_xy] dNN -> p50={best['med']:.1f}  p95={best['p95']:.1f}  max={best['max']:.1f}")
+    return best["rot"], best["shift"]
+
+def select_prior_model(base_dir, inv_type, select_by_name=None, select_by_index=None):
+    tag = {"gravity": "grav", "mag_gradiometry": "mag", "joint": "joint"}.get(str(inv_type).lower(), "")
+    candidates = []
+    for root, _, files in os.walk(base_dir):
+        for f in files:
+            if f.lower().endswith(".csv"):
+                p = os.path.join(root, f)
+                candidates.append(p)
+    if not candidates:
+        raise FileNotFoundError(f"No encontré CSV en {base_dir}")
+
+    if select_by_name:
+        s = select_by_name.lower()
+        filt = [p for p in candidates if s in p.lower()]
+        if filt:
+            candidates = filt
+    candidates.sort()
+
+    if select_by_index is not None:
+        i = int(select_by_index)
+        if i < 0 or i >= len(candidates):
+            raise IndexError(f"select_by_index fuera de rango (0..{len(candidates)-1})")
+        chosen = candidates[i]
+    else:
+        if len(candidates) > 1:
+            print("select_prior_model: varios candidatos, tomo el primero (ord.):")
+            for i, p in enumerate(candidates[:10]):
+                print(f"[{i}] {p}")
+        chosen = candidates[0]
+
+    try:
+        cols = {c.strip().lower() for c in pd.read_csv(chosen, nrows=0).columns}
+        has_rho = any(c in cols for c in ("densidad","density","dens","rho"))
+        has_chi = any(c in cols for c in ("susceptibilidad","susceptibility","chi","k"))
+        prop_guess = "both" if (has_rho and has_chi) else ("densidad" if has_rho else ("susceptibilidad" if has_chi else None))
+    except Exception:
+        prop_guess = None
+
+    print(f"[select_prior_model] elegido: {chosen}  (prop_guess={prop_guess})")
+    return chosen, prop_guess
+
+
+# -------------------- Mapas de misfit / residuos --------------------
+
+def _safe_name(s):
+    return re.sub(r"[^A-Za-z0-9_\-]+", "_", str(s)).strip("_")
+
+
+def _get_misfit_output_dir():
+    try:
+        out_dir = MISFIT_OUTPUT_DIR
+    except NameError:
+        out_dir = None
+    if out_dir is None:
+        return None
+    if str(out_dir).strip() == "":
+        return None
+    os.makedirs(out_dir, exist_ok=True)
+    return out_dir
+
+
+def _sym_limits(vals, pct=98.0):
+    vals = np.asarray(vals, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return -1.0, 1.0
+    a = float(np.nanpercentile(np.abs(vals), pct))
+    if not np.isfinite(a) or a <= 0:
+        a = float(np.nanmax(np.abs(vals))) if vals.size else 1.0
+    if not np.isfinite(a) or a <= 0:
+        a = 1.0
+    return -a, a
+
+
+def _common_limits(a, b, pct=(2.0, 98.0)):
+    vals = np.r_[np.asarray(a, dtype=float).ravel(), np.asarray(b, dtype=float).ravel()]
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return -1.0, 1.0
+    lo, hi = np.nanpercentile(vals, pct)
+    lo, hi = float(lo), float(hi)
+    if not np.isfinite(lo) or not np.isfinite(hi) or not (hi > lo):
+        lo, hi = float(np.nanmin(vals)), float(np.nanmax(vals))
+    if not (hi > lo):
+        hi = lo + 1e-6
+    return lo, hi
+
+
+def _plot_data_misfit_points(
+    xyz, dobs, dpred, standard_deviation,
+    label="Datos", units="", file_prefix="misfit",
+    output_dir=None, show=True
+):
+    """
+    Mapa por puntos de observado / predicho / residual = observado - predicho.
+    No interpola ni extrapola: solo grafica las estaciones/receptores medidos.
+    """
+    xyz = np.asarray(xyz, dtype=float)
+    dobs = np.asarray(dobs, dtype=float).ravel()
+    dpred = np.asarray(dpred, dtype=float).ravel()
+    standard_deviation = np.asarray(standard_deviation, dtype=float).ravel()
+
+    n = min(len(xyz), len(dobs), len(dpred), len(standard_deviation))
+    xyz = xyz[:n]
+    dobs = dobs[:n]
+    dpred = dpred[:n]
+    standard_deviation = standard_deviation[:n]
+
+    residual = dobs - dpred
+    std_safe = np.where(np.abs(standard_deviation) > 0, standard_deviation, np.nan)
+    normalized_residual = residual / std_safe
+    metrics = {
+        "n_data": int(n),
+        "rmse": float(np.sqrt(np.nanmean(residual**2))),
+        "mae": float(np.nanmean(np.abs(residual))),
+        "bias_obs_minus_pred": float(np.nanmean(residual)),
+        "rms_normalized": float(np.sqrt(np.nanmean(normalized_residual**2))),
+        "phi_d": float(0.5 * np.nansum(normalized_residual**2)),
+    }
+
+    vmin_data, vmax_data = _common_limits(dobs, dpred)
+    vmin_res, vmax_res = _sym_limits(residual)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.8), constrained_layout=True)
+
+    panels = [
+        ("Observado", dobs, vmin_data, vmax_data, "viridis"),
+        ("Predicho", dpred, vmin_data, vmax_data, "viridis"),
+        ("Residual (obs - pred)", residual, vmin_res, vmax_res, "coolwarm"),
+    ]
+
+    for ax, (title, vals, vmin, vmax, cmap) in zip(axes, panels):
+        sc = ax.scatter(
+            xyz[:, 0], xyz[:, 1],
+            c=vals, s=28, cmap=cmap,
+            vmin=vmin, vmax=vmax,
+            edgecolors="k", linewidths=0.25
+        )
+        ax.set_title(f"{label} | {title}")
+        ax.set_xlabel("X (m)")
+        ax.set_ylabel("Y (m)")
+        ax.set_aspect("equal", adjustable="box")
+        cbar = fig.colorbar(sc, ax=ax)
+        cbar.set_label(units)
+
+    fig.suptitle(
+        f"{label} | RMSE={metrics['rmse']:.4g} {units}   |   "
+        f"MAE={metrics['mae']:.4g} {units}   |   "
+        f"RMS normalizado={metrics['rms_normalized']:.3f}   |   "
+        f"$\\phi_d$={metrics['phi_d']:.2f}",
+        fontsize=15,
+        y=1.06
+    )
+
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        safe = _safe_name(file_prefix)
+        png_path = os.path.join(output_dir, f"{safe}.png")
+        datos_path = os.path.join(output_dir, f"{safe}_datos.csv")
+        metricas_path = os.path.join(output_dir, f"{safe}_metricas.csv")
+
+        fig.savefig(png_path, dpi=300, bbox_inches="tight")
+        print(f"[misfit] figura guardada: {png_path}")
+
+        df_out = pd.DataFrame({
+            "X": xyz[:, 0],
+            "Y": xyz[:, 1],
+            "Z": xyz[:, 2] if xyz.shape[1] > 2 else np.nan,
+            "observed": dobs,
+            "predicted": dpred,
+            "residual_obs_minus_pred": residual,
+            "standard_deviation": standard_deviation,
+            "normalized_residual": normalized_residual,
+        })
+        df_out.to_csv(datos_path, index=False)
+        print(f"[misfit] datos guardados: {datos_path}")
+
+        metrics_table = pd.DataFrame([{
+            "label": label,
+            "units": units,
+            **metrics,
+        }])
+        metrics_table.to_csv(metricas_path, index=False)
+        print(f"[misfit] métricas guardadas: {metricas_path}")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return {
+        "residual": residual,
+        "normalized_residual": normalized_residual,
+        "metrics": metrics,
+    }
+
+
+def _plot_mag_gradiometry_misfit(
+    xyz_m, dobs_m, dpred_m, std_block, components,
+    output_dir=None, prefix="mag_gradiometry"
+):
+    """
+    Separa los datos vectorizados por componente y grafica observado/predicho/residual
+    para cada componente bxx/byy/bzz/etc.
+    """
+    xyz_m = np.asarray(xyz_m, dtype=float)
+    components = list(components)
+    n = xyz_m.shape[0]
+    nc = len(components)
+
+    dobs_arr = np.asarray(dobs_m, dtype=float).reshape((n, nc), order="C")
+    dpred_arr = np.asarray(dpred_m, dtype=float).reshape((n, nc), order="C")
+    std_arr = np.asarray(std_block, dtype=float).reshape((n, nc), order="C")
+
+    results = {}
+    for j, comp in enumerate(components):
+        results[comp] = _plot_data_misfit_points(
+            xyz_m,
+            dobs_arr[:, j],
+            dpred_arr[:, j],
+            std_arr[:, j],
+            label=f"Gradiometría {comp}",
+            units="nT/m",
+            file_prefix=f"{prefix}_{comp}_obs_pred_residual",
+            output_dir=output_dir,
+            show=True
+        )
+    return results
+
+
+def _maybe_plot_misfit_gravity(xyz_g, gz_obs, dpred_g, errs_g, prefix="gravity"):
+    try:
+        if not PLOT_MISFIT:
+            return None
+    except NameError:
+        return None
+
+    out_dir = _get_misfit_output_dir() if globals().get("SAVE_MISFIT", False) else None
+    return _plot_data_misfit_points(
+        xyz_g, gz_obs, dpred_g, errs_g,
+        label="Gravimetría gz",
+        units="mGal",
+        file_prefix=f"{prefix}_gz_obs_pred_residual",
+        output_dir=out_dir,
+        show=True
+    )
+
+
+def _maybe_plot_misfit_mag(xyz_m, dobs_m, dpred_m, std_block, components, prefix="mag_gradiometry"):
+    try:
+        if not PLOT_MISFIT:
+            return None
+    except NameError:
+        return None
+
+    out_dir = _get_misfit_output_dir() if globals().get("SAVE_MISFIT", False) else None
+    return _plot_mag_gradiometry_misfit(
+        xyz_m, dobs_m, dpred_m, std_block, components,
+        output_dir=out_dir,
+        prefix=prefix
+    )
+
+
+def invert_with_options(
+    dem_file, grav_file, shapefiles, zone_props,
+    depth_limit=600., dome_depth=600., under_depth=2000.,
+    dh=150., nz=40, z_top=3000.,
+    inv_type="gravity",                       # "gravity" | "mag_gradiometry" | "joint"
+    # modelos previos
+    prior_model_file=None, prior_model_property="densidad",  # "densidad" | "susceptibilidad" | "both"
+    # NUEVO: cómo interpretar PROFUNDIDAD del CSV (si aplica)
+    prior_depth_reference="topo",   # "topo" (default) | "flat"
+    prior_ref_elev="auto",          # si "flat": cota Z_REF (float) o "auto"
+    # magnetics gradiometry
+    mag_grad_file=None, mag_grad_files=None, mag_components=None,
+    B0=30055.6, inc=26.78927, dec=-7.63654,
+    fixed_slices=None,
+    # origen del modelo inicial de densidad
+    rho_init_source="auto"  # "auto" | "prior" | "shapes" | "background"
+):
+    """
+    Inversión gravity / mag_gradiometry / joint.
+    Cambios aplicados:
+      - Regularización más suave (alpha_s, alpha_z ↑).
+      - Beta inicial alta y enfriamiento lento.
+      - Sin IRLS (L2 puro).
+      - Pesos del dato ×2 (gravedad y magnético).
+      - Límites con RHO_MIN/RHO_MAX y CHI_MIN/CHI_MAX.
+      - Cross-gradient activo en 'joint'.
+    """
+
+    # --- normalización inv_type
+    it = inv_type.strip().lower() if isinstance(inv_type, str) and inv_type.strip() else ""
+    synonyms = {"grav":"gravity","gz":"gravity","g":"gravity",
+                "mag":"mag_gradiometry","magnetics":"mag_gradiometry","mag_grads":"mag_gradiometry"}
+    inv_type_l = synonyms.get(it, it)
+    if inv_type_l not in {"gravity","mag_gradiometry","joint"}:
+        inv_type_l = "joint" if (mag_grad_file is not None or mag_grad_files is not None) else "gravity"
+    INV_IS_GRAV  = (inv_type_l == "gravity")
+    INV_IS_MAG   = (inv_type_l == "mag_gradiometry")
+    INV_IS_JOINT = (inv_type_l == "joint")
+
+    if mag_grad_files is None and mag_grad_file is not None:
+        mag_grad_files = [mag_grad_file]
+
+    # --- fallbacks de config global
+    try:
+        prior_ref_weight_rho = PRIOR_REF_WEIGHT_RHO
+    except NameError:
+        prior_ref_weight_rho = 0.30
+    try:
+        prior_ref_weight_chi = PRIOR_REF_WEIGHT_CHI
+    except NameError:
+        prior_ref_weight_chi = 0.30
+    try:
+        prior_xy_shift = PRIOR_XY_SHIFT
+    except NameError:
+        prior_xy_shift = (0.0, 0.0)
+    try:
+        prior_z_is_depth = PRIOR_Z_IS_DEPTH
+    except NameError:
+        prior_z_is_depth = False
+    try:
+        prior_z_offset = PRIOR_Z_OFFSET
+    except NameError:
+        prior_z_offset = 0.0
+
+    # --- 1) DEM
+    topo, topo_xyz, utm_crs = read_dem(dem_file)
+
+    # --- 2) GRAV
+    ext = os.path.splitext(grav_file)[1].lower()
+    if ext in (".xls",".xlsx"):
+        df0 = pd.read_excel(grav_file)
+        df = df0.rename(columns={"Lat (°)":"Lat","Long (°)":"Lon","Height (m)":"Z","ΔB (mGal)":"gz"})
+        tf = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+        df["X"], df["Y"] = tf.transform(df.Lon.values, df.Lat.values)
+    else:
+        df = pd.read_csv(grav_file)
+    if not {"X","Y","Z","gz"}.issubset(df.columns):
+        raise KeyError("El archivo de gravedad debe tener columnas X,Y,Z,gz")
+    xyz_g  = df[["X","Y","Z"]].values
+    gz_obs = df["gz"].values.astype(float)
+    std_g = np.std(gz_obs); std_g = std_g if std_g > 1e-9 else 1.0
+    errs_g = std_g*np.ones_like(gz_obs)
+
+    # --- 3) Malla activa
+    mesh, active = build_mesh_and_active(xyz_g, topo_xyz, dh, nz, z_top)
+    CC_act = mesh.gridCC[active]
+    _, idx_top = cKDTree(topo_xyz[:, :2]).query(CC_act[:, :2])
+    tz = topo_xyz[idx_top, 2]
+
+    # --- 4) Modelos iniciales
+    bg = zone_props["background"]
+    m0rho = np.ones(active.sum()) * bg
+    m0chi = None
+    init_source = "background"
+
+    use_prior    = (prior_model_file is not None)
+    force_prior  = (rho_init_source == "prior")
+    force_shapes = (rho_init_source == "shapes")
+    force_bg     = (rho_init_source == "background")
+
+    # 4.a) Densidad (m0rho)
+    if INV_IS_GRAV or INV_IS_JOINT:
+        if force_bg:
+            init_source = "background"
+        elif force_prior or (rho_init_source == "auto" and use_prior):
+            m0rho = load_prior_model_csv(
+                prior_model_file, mesh, active, prop="densidad",
+                xy_shift=prior_xy_shift,
+                z_is_depth=prior_z_is_depth, z_offset=prior_z_offset,
+                topo_xyz=topo_xyz,
+                depth_datum=prior_depth_reference, ref_elev=prior_ref_elev,
+                auto_calibrate=False
+            )
+            init_source = "prior CSV (densidad)"
+        elif force_shapes or (rho_init_source == "auto" and not use_prior):
+            gdfs = {k: gpd.read_file(v).to_crs(utm_crs) for k, v in shapefiles.items()}
+            for zn in ["unidades","flujos","crater","domo"]:
+                d = zone_props[zn]["dens"]
+                poly = _union_all(gdfs[zn])
+                mxy = _contains_xy(poly, CC_act[:,0], CC_act[:,1])
+                mz  = (CC_act[:,2] <= tz) & (CC_act[:,2] >= tz - dome_depth)
+                m0rho[mxy & mz] = d
+            poly_dome = _union_all(gdfs["domo"])
+            mxy_dome  = _contains_xy(poly_dome, CC_act[:,0], CC_act[:,1])
+            uz = (CC_act[:,2] < tz - dome_depth) & (CC_act[:,2] >= tz - under_depth)
+            m0rho[mxy_dome & uz] = zone_props["under_dome"]["dens"]
+            init_source = "shapefiles"
+
+    # 4.b) Susceptibilidad
+    if INV_IS_MAG or INV_IS_JOINT:
+        m0chi = None
+
+        # 1) Si hay CSV previo y trae χ, úsalo
+        if use_prior and prior_model_property in ("susceptibilidad", "both"):
+            try:
+                m0chi = load_prior_model_csv(
+                    prior_model_file, mesh, active, prop="susceptibilidad",
+                    xy_shift=prior_xy_shift,
+                    z_is_depth=prior_z_is_depth, z_offset=prior_z_offset,
+                    topo_xyz=topo_xyz,
+                    depth_datum=prior_depth_reference, ref_elev=prior_ref_elev,
+                    auto_calibrate=False
+                )
+                print("[invert_with_options] init susceptibility source = prior CSV")
+            except Exception as e:
+                print("[warn] no se pudo leer χ del CSV:", e)
+                m0chi = None
+
+        # 2) Si NO hay previo, semillar χ con shapefiles (obligatorio que zone_props tenga 'chi')
+        if m0chi is None:
+            # fondo por defecto (si una zona no cubre, queda 0.01)
+            chi_bg = float(zone_props.get("background_chi", 0.01))
+            m0chi = np.zeros(active.sum()) + chi_bg
+
+            gdfs = {k: gpd.read_file(v).to_crs(utm_crs) for k, v in shapefiles.items()}
+
+            # zonas someras (mismo enmascaramiento vertical que para ρ)
+            for zn in ["unidades", "flujos", "crater", "domo"]:
+                if "chi" not in zone_props[zn]:
+                    print(f"[warn] zone_props['{zn}'] no tiene chi; uso chi_bg={chi_bg}")
+                chi_val = zone_props[zn].get("chi", chi_bg)
+                poly = _union_all(gdfs[zn])
+                mxy = _contains_xy(poly, CC_act[:, 0], CC_act[:, 1])
+                mz  = (CC_act[:, 2] <= tz) & (CC_act[:, 2] >= tz - dome_depth)
+                m0chi[mxy & mz] = chi_val
+
+            # bajo el domo (profundo)
+            if "chi" not in zone_props["under_dome"]:
+                print(f"[warn] zone_props['under_dome'] no tiene chi; uso chi_bg={chi_bg}")
+            poly_dome = _union_all(gdfs["domo"])
+            mxy_dome  = _contains_xy(poly_dome, CC_act[:, 0], CC_act[:, 1])
+            uz = (CC_act[:, 2] < tz - dome_depth) & (CC_act[:, 2] >= tz - under_depth)
+            m0chi[mxy_dome & uz] = zone_props["under_dome"].get("chi", chi_bg)
+
+            print("[invert_with_options] init susceptibility source = shapefiles")
+
+    # --- 5) Cortes fijos: parsing y conversión coord→índice
+    fixed2 = None; fixed4 = None
+    if fixed_slices is not None:
+        if isinstance(fixed_slices, tuple):
+            if len(fixed_slices) == 2:
+                fixed2 = fixed_slices
+            elif len(fixed_slices) == 4:
+                fixed4 = fixed_slices
+            else:
+                raise ValueError("fixed_slices debe ser (Z_CUT, Y_CUT) o (Z_CUT, Y_CUT, depth_top, depth_bottom).")
+        else:
+            raise ValueError("fixed_slices debe ser tupla o None.")
+
+    if fixed2 is not None and fixed4 is None:
+        zs = mesh.cell_centers_z
+        fixed4 = (float(fixed2[0]), float(fixed2[1]), float(np.max(zs)), float(np.min(zs)))
+
+    if fixed4 is not None:
+        zc, yc, depth_top, depth_bottom = fixed4
+        def _idx_from_coord(val, axis_vals):
+            if isinstance(val, (int, np.integer)):
+                return int(val)
+            return int(np.argmin(np.abs(axis_vals - float(val))))
+        zi = _idx_from_coord(zc, mesh.cell_centers_z)
+        yi = _idx_from_coord(yc, mesh.cell_centers_y)
+        fixed4 = (zi, yi, float(depth_top), float(depth_bottom))
+
+    out = {
+        "mesh": mesh, "active": active,
+        "rho_init": m0rho, "chi_init": m0chi,
+        "rho_rec": None, "chi_rec": None
+    }
+
+    # =========================
+    # 6) BLOQUES DE INVERSIÓN
+    # =========================
+    if INV_IS_GRAV:
+        wires  = maps.Wires(("density", active.sum()))
+        rx_g   = gravity.receivers.Point(xyz_g, components="gz")
+        src_g  = gravity.sources.SourceField([rx_g])
+        survey_g = gravity.survey.Survey(src_g)
+        sim_g  = gravity.simulation.Simulation3DIntegral(
+            mesh=mesh, rhoMap=wires.density, survey=survey_g,
+            active_cells=active, store_sensitivities="disk"
+        )
+
+        dobj_g = data.Data(survey_g, dobs=gz_obs, standard_deviation=errs_g)
+        dmis_g = data_misfit.L2DataMisfit(data=dobj_g, simulation=sim_g)
+
+        m_ref   = None                      # <- no anclar al previo
+        m_start = (m0rho - bg).copy()
+
+        reg_g  = regularization.WeightedLeastSquares(
+            mesh, active_cells=active, mapping=wires.density,
+            alpha_s=3e-2, alpha_x=1e-3, alpha_y=1e-3, alpha_z=1e-2,
+            reference_model=m_ref
+        )
+
+        opt = optimization.ProjectedGNCG(
+            maxIter=20, lower=RHO_MIN - bg, upper=RHO_MAX - bg
+        )
+        dirs = [
+            directives.BetaEstimate_ByEig(beta0_ratio=20.0),
+            directives.BetaSchedule(coolingFactor=1.5, coolingRate=1.0),
+            # directives.Update_IRLS(max_irls_iterations=10, f_min_change=1e-4),
+        ]
+        invp = inverse_problem.BaseInvProblem(dmis_g, reg_g, opt)
+        inv  = inversion.BaseInversion(invp, directiveList=dirs)
+
+        mrec    = inv.run(m_start)
+        rho_rec = mrec + bg
+        out["rho_rec"] = rho_rec
+
+        # Mapas observado / predicho / residual para gravedad
+        try:
+            dpred_g = np.asarray(sim_g.dpred(mrec), dtype=float).ravel()
+            _maybe_plot_misfit_gravity(
+                xyz_g, gz_obs, dpred_g, errs_g,
+                prefix="gravity"
+            )
+        except Exception as e:
+            print("[warn] no se pudo graficar misfit de gravedad:", e)
+
+        cuts = fixed4 if (fixed4 is not None) else _select_auto_slices(
+            mesh, active, rho_rec, bg=bg
+        )
+        _ = _plot_density_results(
+            mesh, active, m0rho, rho_rec, topo_xyz, xyz_g, zone_props,
+            fixed_slices=cuts, slice_source="recovered"
+        )
+        _plot_model_3d(
+            mesh, active, m0rho, rho_rec,
+            label="Densidad (g/cc)", vmin=RHO_MIN, vmax=RHO_MAX,
+            alpha=0.8, stride=(1,1,1)
+        )
+        return out
+
+    elif INV_IS_MAG:
+        # ----- Datos magnéticos
+        if mag_grad_files is not None:
+            grad_df = integrate_mag_grad_files(mag_grad_files, utm_crs)
+            xyz_m = grad_df[["X","Y","Z"]].values
+            if mag_components is None:
+                components = [c for c in ["bxx","byy","bzz"] if c in grad_df.columns]
+            else:
+                components = [c for c in mag_components if c in grad_df.columns]
+            if len(components) == 0:
+                raise KeyError("No se encontraron componentes válidos (bxx/byy/bzz).")
+            M = np.column_stack([grad_df[c].values.astype(float) for c in components])
+            dobs_m = M.ravel(order="C")
+            stds = []
+            for c in components:
+                s = np.nanstd(grad_df[c].values.astype(float))
+                stds.append(s if s > 1e-12 else 1.0)
+
+            std_block = np.column_stack([np.ones(len(grad_df))*s for s in stds]).ravel(order="C")
+            std_block = std_block * MAG_DATA_STD_FACTOR
+        else:
+            if mag_grad_file is None:
+                raise ValueError("Para 'mag_gradiometry' pasa mag_grad_file o mag_grad_files=[...]")
+            dfm = pd.read_csv(mag_grad_file).copy()
+            if not {"X","Y"}.issubset(dfm.columns):
+                if not {"Latitud","Longitud"}.issubset(dfm.columns):
+                    raise KeyError("mag_grad_file debe tener X,Y o Latitud,Longitud.")
+                tr = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+                X, Y = tr.transform(dfm["Longitud"].astype(float).values,
+                                    dfm["Latitud"].astype(float).values)
+                dfm["X"], dfm["Y"] = X, Y
+            zcol = None
+            for c in dfm.columns:
+                if c.strip().lower() in {"z","altura","altura_m","altitude","elev","elevation"}:
+                    zcol = c; break
+            dfm["Z"] = dfm[zcol].astype(float) if zcol else 0.0
+            if "bxx" not in dfm and "dB_E_dE" in dfm: dfm["bxx"] = dfm["dB_E_dE"].astype(float)
+            if "byy" not in dfm and "dB_N_dN" in dfm: dfm["byy"] = dfm["dB_N_dN"].astype(float)
+            if "bzz" not in dfm and "dB_V_dZ" in dfm: dfm["bzz"] = dfm["dB_V_dZ"].astype(float)
+            allowed = ["bxx","bxy","bxz","byy","byz","bzz"]
+            if mag_components is None:
+                components = [c for c in allowed if c in dfm.columns]
+            else:
+                components = [c for c in mag_components if c in dfm.columns and c in allowed]
+            if len(components) == 0:
+                raise KeyError(f"No se encontraron columnas de gradiente en {allowed}.")
+            xyz_m = dfm[["X","Y","Z"]].values
+            M = np.column_stack([dfm[c].values.astype(float) for c in components])
+            dobs_m = M.ravel(order="C")
+            stds = []
+            for c in components:
+                s = np.nanstd(dfm[c].values.astype(float))
+                stds.append(s if s > 1e-12 else 1.0)
+            std_block = np.column_stack([np.ones(len(dfm))*s for s in stds]).ravel(order="C")
+            std_block = std_block * MAG_DATA_STD_FACTOR
+
+        # ----- Simulación / misfit / regularización
+        receiver_list = [magnetics.receivers.Point(xyz_m, components=components)]
+        source_field = magnetics.sources.UniformBackgroundField(
+            receiver_list=receiver_list, amplitude=B0, inclination=inc, declination=dec
+        )
+        survey_m = magnetics.survey.Survey(source_field)
+        sim_m = magnetics.simulation.Simulation3DIntegral(
+            mesh=mesh, chiMap=maps.IdentityMap(nP=active.sum()),
+            survey=survey_m, active_cells=active, store_sensitivities="disk",
+        )
+        dobj_m = data.Data(survey_m, dobs=dobs_m, standard_deviation=std_block)
+        dmis_m = data_misfit.L2DataMisfit(data=dobj_m, simulation=sim_m)
+
+        # Modelo inicial de chi, acotado al rango de inversión suave.
+        # Mantiene la geometría inicial si viene de shapefiles/prior,
+        # pero evita que la inversión arranque o se dispare fuera del rango útil.
+        m0 = np.clip(m0chi.copy(), MAG_CHI_LOWER, MAG_CHI_UPPER)
+
+        reg_m  = regularization.WeightedLeastSquares(
+            mesh, active_cells=active, mapping=maps.IdentityMap(nP=active.sum()),
+            alpha_s=MAG_ALPHA_S_CHI,
+            alpha_x=MAG_ALPHA_X_CHI,
+            alpha_y=MAG_ALPHA_Y_CHI,
+            alpha_z=MAG_ALPHA_Z_CHI,
+            reference_model=m0
+        )
+
+        lower = np.full(active.sum(), MAG_CHI_LOWER)
+        upper = np.full(active.sum(), MAG_CHI_UPPER)
+        opt = optimization.ProjectedGNCG(maxIter=20, lower=lower, upper=upper)
+
+        dirs = [
+            directives.BetaEstimate_ByEig(beta0_ratio=2.0),
+            directives.BetaSchedule(coolingFactor=2.0, coolingRate=1.0),
+            # directives.Update_IRLS(max_irls_iterations=10, f_min_change=1e-4)
+        ]
+        invp = inverse_problem.BaseInvProblem(dmis_m, reg_m, opt)
+        inv  = inversion.BaseInversion(invp, directiveList=dirs)
+        chi_rec = inv.run(m0)
+        out["chi_rec"] = chi_rec
+
+        print("\n=== DIAGNÓSTICO MAG_GRADIOMETRY / CHI ===")
+        print("chi init min/max:", np.nanmin(m0), np.nanmax(m0))
+        print("chi rec  min/max:", np.nanmin(chi_rec), np.nanmax(chi_rec))
+        print("chi rec percentiles 1/5/50/95/99:",
+              np.nanpercentile(chi_rec, [1, 5, 50, 95, 99]))
+        print("% celdas en lower:", np.mean(chi_rec <= MAG_CHI_LOWER + 1e-8) * 100)
+        print("% celdas en upper:", np.mean(chi_rec >= MAG_CHI_UPPER - 1e-8) * 100)
+
+        # Mapas observado / predicho / residual para gradiometría
+        try:
+            dpred_m = np.asarray(sim_m.dpred(chi_rec), dtype=float).ravel()
+            _maybe_plot_misfit_mag(
+                xyz_m, dobs_m, dpred_m, std_block, components,
+                prefix="mag_gradiometry"
+            )
+        except Exception as e:
+            print("[warn] no se pudo graficar misfit de gradiometría:", e)
+
+        cuts_chi = fixed4 if (fixed4 is not None) else _select_auto_slices(mesh, active, m0chi, bg=0.0)
+        _ = _plot_scalar_results(
+            mesh, active, m0chi, chi_rec, topo_xyz,
+            label="Susceptibilidad (SI)",
+            vmin=CHI_PLOT_MIN, vmax=CHI_PLOT_MAX,
+            fixed_slices=cuts_chi,
+            bg=0.0,
+            slice_source="recovered"
+        )
+        _plot_model_3d(
+            mesh, active, m0chi, chi_rec,
+            label="Susceptibilidad (SI)", vmin=CHI_PLOT_MIN, vmax=CHI_PLOT_MAX,
+            alpha=0.8, stride=(1,1,1)
+        )
+        return out
+
+    elif INV_IS_JOINT:
+        # ----- Datos magnéticos (idéntico a MAG; std ×2)
+        if mag_grad_files is not None:
+            grad_df = integrate_mag_grad_files(mag_grad_files, utm_crs)
+            xyz_m = grad_df[["X","Y","Z"]].values
+            if mag_components is None:
+                components = [c for c in ["bxx","byy","bzz"] if c in grad_df.columns]
+            else:
+                components = [c for c in mag_components if c in grad_df.columns]
+            if len(components) == 0:
+                raise KeyError("No se encontraron componentes válidos (bxx/byy/bzz).")
+            M = np.column_stack([grad_df[c].values.astype(float) for c in components])
+            dobs_m = M.ravel(order="C")
+            stds = []
+            for c in components:
+                s = np.nanstd(grad_df[c].values.astype(float))
+                stds.append(s if s > 1e-12 else 1.0)
+            std_block = np.column_stack([np.ones(len(grad_df))*s for s in stds]).ravel(order="C")
+            std_block = std_block * JOINT_MAG_DATA_STD_FACTOR
+        else:
+            if mag_grad_file is None:
+                raise ValueError("Para 'joint' pasa mag_grad_file o mag_grad_files=[...]")
+            dfm = pd.read_csv(mag_grad_file).copy()
+            if not {"X","Y"}.issubset(dfm.columns):
+                if not {"Latitud","Longitud"}.issubset(dfm.columns):
+                    raise KeyError("mag_grad_file debe tener X,Y o Latitud,Longitud.")
+                tr = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+                X, Y = tr.transform(dfm["Longitud"].astype(float).values,
+                                    dfm["Latitud"].astype(float).values)
+                dfm["X"], dfm["Y"] = X, Y
+            zcol = None
+            for c in dfm.columns:
+                if c.strip().lower() in {"z","altura","altura_m","altitude","elev","elevation"}:
+                    zcol = c; break
+            dfm["Z"] = dfm[zcol].astype(float) if zcol else 0.0
+            if "bxx" not in dfm and "dB_E_dE" in dfm: dfm["bxx"] = dfm["dB_E_dE"].astype(float)
+            if "byy" not in dfm and "dB_N_dN" in dfm: dfm["byy"] = dfm["dB_N_dN"].astype(float)
+            if "bzz" not in dfm and "dB_V_dZ" in dfm: dfm["bzz"] = dfm["dB_V_dZ"].astype(float)
+            allowed = ["bxx","bxy","bxz","byy","byz","bzz"]
+            if mag_components is None:
+                components = [c for c in allowed if c in dfm.columns]
+            else:
+                components = [c for c in mag_components if c in dfm.columns and c in allowed]
+            if len(components) == 0:
+                raise KeyError(f"No se encontraron columnas de gradiente en {allowed}.")
+            xyz_m = dfm[["X","Y","Z"]].values
+            M = np.column_stack([dfm[c].values.astype(float) for c in components])
+            dobs_m = M.ravel(order="C")
+            stds = []
+            for c in components:
+                s = np.nanstd(dfm[c].values.astype(float))
+                stds.append(s if s > 1e-12 else 1.0)
+            std_block = np.column_stack([np.ones(len(dfm))*s for s in stds]).ravel(order="C")
+            std_block = std_block * JOINT_MAG_DATA_STD_FACTOR
+
+        # ----- Wires & simuladores
+        nA = int(active.sum())
+        wires = maps.Wires(("density", nA), ("chi", nA))
+
+        # Gravity
+        rx_g   = gravity.receivers.Point(xyz_g, components="gz")
+        src_g  = gravity.sources.SourceField([rx_g])
+        survey_g = gravity.survey.Survey(src_g)
+        sim_g  = gravity.simulation.Simulation3DIntegral(
+            mesh=mesh, rhoMap=wires.density, survey=survey_g,
+            active_cells=active, store_sensitivities="disk",
+        )
+        errs_g_joint = errs_g * JOINT_GRAV_DATA_STD_FACTOR
+        dobj_g = data.Data(survey_g, dobs=gz_obs, standard_deviation=errs_g_joint)
+
+        # Magnetics
+        receiver_list = [magnetics.receivers.Point(xyz_m, components=components)]
+        source_field  = magnetics.sources.UniformBackgroundField(
+            receiver_list=receiver_list, amplitude=B0, inclination=inc, declination=dec
+        )
+        survey_m = magnetics.survey.Survey(source_field)
+        sim_m  = magnetics.simulation.Simulation3DIntegral(
+            mesh=mesh, chiMap=wires.chi, survey=survey_m,
+            active_cells=active, store_sensitivities="disk",
+        )
+        dobj_m = data.Data(survey_m, dobs=dobs_m, standard_deviation=std_block)
+
+        # ----- Misfits y suma
+        dmis_g = data_misfit.L2DataMisfit(data=dobj_g, simulation=sim_g)
+        dmis_m = data_misfit.L2DataMisfit(data=dobj_m, simulation=sim_m)
+        dmis   = dmis_g + dmis_m
+
+        # ----- Regularización conjunta v3: anclada al modelo inicial
+        # SOLO aplica a inv_type='joint'. No toca las inversiones individuales.
+        nA = int(active.sum())
+
+        # Referencia y arranque:
+        # densidad desde modelo inicial de rho; chi acotada al rango suave.
+        rho0_joint = np.clip(m0rho, JOINT_RHO_LOWER, JOINT_RHO_UPPER) - bg
+        chi0_joint = np.clip(m0chi, JOINT_CHI_LOWER, JOINT_CHI_UPPER)
+
+        mref_joint = np.r_[rho0_joint, chi0_joint]
+        mstart_joint = mref_joint.copy()
+
+        reg_rho = regularization.WeightedLeastSquares(
+            mesh, active_cells=active, mapping=wires.density,
+            alpha_s=JOINT_ALPHA_S_RHO,
+            alpha_x=JOINT_ALPHA_X_RHO,
+            alpha_y=JOINT_ALPHA_Y_RHO,
+            alpha_z=JOINT_ALPHA_Z_RHO,
+            reference_model=mref_joint
+        )
+        reg_chi = regularization.WeightedLeastSquares(
+            mesh, active_cells=active, mapping=wires.chi,
+            alpha_s=JOINT_ALPHA_S_CHI,
+            alpha_x=JOINT_ALPHA_X_CHI,
+            alpha_y=JOINT_ALPHA_Y_CHI,
+            alpha_z=JOINT_ALPHA_Z_CHI,
+            reference_model=mref_joint
+        )
+
+        # La inversión sigue siendo simultánea porque dmis = gravity + mag.
+        # El cross-gradient queda apagado por defecto para que no fuerce estructuras espurias.
+        if JOINT_USE_CROSS_GRADIENT and JOINT_XG_MU != 0:
+            cross_grad = regularization.CrossGradient(
+                mesh, wires, active_cells=active
+            )
+            reg = reg_rho + reg_chi + JOINT_XG_MU * cross_grad
+            print(f"[joint] Cross-gradient ACTIVO con JOINT_XG_MU={JOINT_XG_MU:.2e}")
+        else:
+            reg = reg_rho + reg_chi
+            print("[joint] Cross-gradient APAGADO; simultánea = gravity + mag con regularización separada.")
+
+        lower = np.r_[np.full(nA, JOINT_RHO_LOWER - bg), np.full(nA, JOINT_CHI_LOWER)]
+        upper = np.r_[np.full(nA, JOINT_RHO_UPPER - bg), np.full(nA, JOINT_CHI_UPPER)]
+        opt = optimization.ProjectedGNCG(maxIter=20, lower=lower, upper=upper)
+
+        # ----- Directrices joint v3
+        dirs = [
+            directives.BetaEstimate_ByEig(beta0_ratio=JOINT_BETA0_RATIO),
+            directives.BetaSchedule(coolingFactor=JOINT_BETA_COOLING_FACTOR, coolingRate=1.0),
+            # directives.Update_IRLS(max_irls_iterations=10, f_min_change=1e-4),
+        ]
+        invp = inverse_problem.BaseInvProblem(dmis, reg, opt)
+        inv  = inversion.BaseInversion(invp, directiveList=dirs)
+
+        mrec_joint = inv.run(mstart_joint)
+        wires_out = maps.Wires(("density", nA), ("chi", nA))
+        rho_rec = (wires_out.density * mrec_joint) + bg
+        chi_rec = (wires_out.chi * mrec_joint)
+        out["rho_rec"] = rho_rec
+        out["chi_rec"] = chi_rec
+
+        print("\n=== DIAGNÓSTICO JOINT V3 ===")
+        print("rho rec min/max:", np.nanmin(rho_rec), np.nanmax(rho_rec))
+        print("rho rec percentiles 1/5/50/95/99:",
+              np.nanpercentile(rho_rec, [1, 5, 50, 95, 99]))
+        print("% rho en lower:", np.mean(rho_rec <= JOINT_RHO_LOWER + 1e-8) * 100)
+        print("% rho en upper:", np.mean(rho_rec >= JOINT_RHO_UPPER - 1e-8) * 100)
+        print("chi rec min/max:", np.nanmin(chi_rec), np.nanmax(chi_rec))
+        print("chi rec percentiles 1/5/50/95/99:",
+              np.nanpercentile(chi_rec, [1, 5, 50, 95, 99]))
+        print("% chi en lower:", np.mean(chi_rec <= JOINT_CHI_LOWER + 1e-8) * 100)
+        print("% chi en upper:", np.mean(chi_rec >= JOINT_CHI_UPPER - 1e-8) * 100)
+
+        try:
+            dpred_g_joint = np.asarray(sim_g.dpred(mrec_joint), dtype=float).ravel()
+            _maybe_plot_misfit_gravity(
+                xyz_g, gz_obs, dpred_g_joint, errs_g_joint,
+                prefix="joint_gravity"
+            )
+        except Exception as e:
+            print("[warn] no se pudo graficar misfit de gravedad conjunta:", e)
+
+        try:
+            dpred_m_joint = np.asarray(sim_m.dpred(mrec_joint), dtype=float).ravel()
+            _maybe_plot_misfit_mag(
+                xyz_m, dobs_m, dpred_m_joint, std_block, components,
+                prefix="joint_mag_gradiometry"
+            )
+        except Exception as e:
+            print("[warn] no se pudo graficar misfit de gradiometría conjunta:", e)
+
+        # ----- DENSIDAD
+        cuts_rho = fixed4 if (fixed4 is not None) else _select_auto_slices(
+            mesh, active, m0rho, bg=bg
+        )
+        _ = _plot_density_results(
+            mesh, active, m0rho, rho_rec, topo_xyz, xyz_g, zone_props,
+            fixed_slices=cuts_rho, slice_source="recovered"
+        )
+        _plot_model_3d(
+            mesh, active, m0rho, rho_rec,
+            label="Densidad (g/cc)", vmin=RHO_MIN, vmax=RHO_MAX,
+            alpha=0.8, stride=(1,1,1)
+        )
+
+        # ----- SUSCEPTIBILIDAD
+        cuts_chi = cuts_rho if (fixed4 is not None) else _select_auto_slices(
+            mesh, active, m0chi, bg=0.0
+        )
+        _ = _plot_scalar_results(
+            mesh, active, m0chi, chi_rec, topo_xyz,
+            label="Susceptibilidad (SI)",
+            vmin=CHI_PLOT_MIN, vmax=CHI_PLOT_MAX,
+            fixed_slices=cuts_chi,
+            bg=0.0,
+            slice_source="recovered"
+        )
+        _plot_model_3d(
+            mesh, active, m0chi, chi_rec,
+            label="Susceptibilidad (SI)", vmin=CHI_PLOT_MIN, vmax=CHI_PLOT_MAX,
+            alpha=0.8, stride=(1,1,1)
+        )
+        return out
+
+    else:
+        raise ValueError("inv_type debe ser 'gravity', 'mag_gradiometry' o 'joint'.")
+
+
+def _select_auto_slices(mesh, active, ref_vec, bg=None):
+    shape = mesh.shape_cells
+    vol = np.full(shape, np.nan, order="F")
+    act_idx = np.where(active)[0]
+    act_idx_3D = np.unravel_index(act_idx, shape, order="F")
+    vol[act_idx_3D] = ref_vec
+
+    if bg is not None:
+        vol = np.abs(vol - bg)
+
+    z_idx  = int(np.nanargmax(np.nanmean(vol, axis=(0, 1))))
+    y_idx  = int(np.nanargmax(np.nanmean(vol, axis=(0, 2))))
+
+    zs = mesh.cell_centers_z
+    depth_top = float(np.max(zs))
+    depth_bottom = float(np.min(zs))
+    return (z_idx, y_idx, depth_top, depth_bottom)
+
+def _plot_density_results(
+    mesh, active, m0, rho_rec, topo_xyz, xyz, zone_props, fixed_slices=None,
+    slice_source="recovered"  # "recovered" | "initial"
+):
+    xs = mesh.cell_centers_x
+    ys = mesh.cell_centers_y
+    zs = mesh.cell_centers_z
+    shape = mesh.shape_cells
+    bg = zone_props["background"]
+
+    dens0_3D = np.full(shape, np.nan, order="F")
+    densR_3D = np.full(shape, np.nan, order="F")
+    act_idx = np.where(active)[0]
+    act_idx_3D = np.unravel_index(act_idx, shape, order="F")
+    dens0_3D[act_idx_3D] = m0
+    densR_3D[act_idx_3D] = rho_rec
+
+    # ---------- ESCALA COMÚN (robusta + extremos del previo)
+    rho_all = np.r_[m0[np.isfinite(m0)], rho_rec[np.isfinite(rho_rec)]]
+    if rho_all.size > 0:
+        qlo, qhi = np.nanpercentile(rho_all, [0.1, 99.9])
+        vmin_rho = max(RHO_MIN, float(min(qlo, np.nanmin(m0))))
+        vmax_rho = min(RHO_MAX, float(max(qhi, np.nanmax(m0))))
+        if not (vmax_rho > vmin_rho):
+            vmax_rho = vmin_rho + 1e-6
+        # si la ventana quedó demasiado angosta, ábrela un poco para que haya contraste
+        if (vmax_rho - vmin_rho) < 0.05:
+            mid = 0.5*(vmax_rho + vmin_rho)
+            vmin_rho = max(RHO_MIN, mid - 0.05)
+            vmax_rho = min(RHO_MAX, mid + 0.05)
+    else:
+        vmin_rho, vmax_rho = RHO_MIN, RHO_MAX
+    # ---------------------------------------
+
+    # Cortes
+    if fixed_slices is None:
+        if slice_source.lower().startswith("rec"):
+            z_idx, y_idx, depth_top, depth_bottom = _select_auto_slices(mesh, active, rho_rec, bg=bg)
+        else:
+            z_idx, y_idx, depth_top, depth_bottom = _select_auto_slices(mesh, active, m0, bg=bg)
+    else:
+        z_idx, y_idx, depth_top, depth_bottom = fixed_slices
+
+    zlev = zs[z_idx]
+    ylev = ys[y_idx]
+    z_mask = (zs >= depth_bottom) & (zs <= depth_top)
+
+    fig = plt.figure(figsize=(16, 18))
+    gs = fig.add_gridspec(3, 2)
+
+    # Horizontal inicial
+    ax1 = fig.add_subplot(gs[0, 0])
+    im1 = ax1.imshow(
+        dens0_3D[:, :, z_idx].T,
+        extent=[xs.min(), xs.max(), ys.min(), ys.max()],
+        origin="lower", cmap="viridis", vmin=vmin_rho, vmax=vmax_rho
+    )
+    ax1.set_title(f"Corte Horizontal @ Z = {zlev:.1f} m (Inicial)")
+    plt.colorbar(im1, ax=ax1, label="Densidad (g/cc)")
+    ax1.scatter(xyz[:, 0], xyz[:, 1], c="white", s=10, marker="o", alpha=0.5, label="Estaciones")
+    ax1.legend()
+
+    # Horizontal recuperado
+    ax2 = fig.add_subplot(gs[0, 1])
+    im2 = ax2.imshow(
+        densR_3D[:, :, z_idx].T,
+        extent=[xs.min(), xs.max(), ys.min(), ys.max()],
+        origin="lower", cmap="viridis", vmin=vmin_rho, vmax=vmax_rho
+    )
+    ax2.set_title(f"Corte Horizontal @ Z = {zlev:.1f} m (Recuperado)")
+    plt.colorbar(im2, ax=ax2, label="Densidad (g/cc)")
+    ax2.scatter(xyz[:, 0], xyz[:, 1], c="white", s=10, marker="o", alpha=0.5, label="Estaciones")
+    ax2.legend()
+
+    # Vertical inicial
+    ax3 = fig.add_subplot(gs[1, 0])
+    im3 = ax3.imshow(
+        dens0_3D[:, y_idx, :].T[z_mask, :],
+        extent=[xs.min(), xs.max(), depth_bottom, depth_top],
+        origin="lower", cmap="viridis", aspect="auto", vmin=vmin_rho, vmax=vmax_rho
+    )
+    ax3.set_title(f"Corte Vertical @ Y = {ylev:.1f} m (Inicial)")
+    plt.colorbar(im3, ax=ax3, label="Densidad (g/cc)")
+
+    # Vertical recuperado
+    ax4 = fig.add_subplot(gs[1, 1])
+    im4 = ax4.imshow(
+        densR_3D[:, y_idx, :].T[z_mask, :],
+        extent=[xs.min(), xs.max(), depth_bottom, depth_top],
+        origin="lower", cmap="viridis", aspect="auto", vmin=vmin_rho, vmax=vmax_rho
+    )
+    ax4.set_title(f"Corte Vertical @ Y = {ylev:.1f} m (Recuperado)")
+    plt.colorbar(im4, ax=ax4, label="Densidad (g/cc)")
+
+    plt.tight_layout()
+    plt.show()
+    return (z_idx, y_idx, depth_top, depth_bottom)
+
+
+def _plot_scalar_results(
+    mesh, active, m0, mrec, topo_xyz, label="Propiedad",
+    vmin=None, vmax=None, fixed_slices=None, bg=None,
+    slice_source="recovered"  # "recovered" | "initial"
+):
+    xs = mesh.cell_centers_x
+    ys = mesh.cell_centers_y
+    zs = mesh.cell_centers_z
+    shape = mesh.shape_cells
+
+    m0_3D = np.full(shape, np.nan, order="F")
+    mr_3D = np.full(shape, np.nan, order="F")
+    act_idx = np.where(active)[0]
+    act_idx_3D = np.unravel_index(act_idx, shape, order="F")
+    m0_3D[act_idx_3D] = m0
+    mr_3D[act_idx_3D] = mrec
+
+    # Cortes
+    if fixed_slices is None:
+        ref = mrec if slice_source.lower().startswith("rec") else m0
+        z_idx, y_idx, depth_top, depth_bottom = _select_auto_slices(mesh, active, ref, bg=bg)
+    else:
+        z_idx, y_idx, depth_top, depth_bottom = fixed_slices
+
+    zlev = zs[z_idx]
+    ylev = ys[y_idx]
+    z_mask = (zs >= depth_bottom) & (zs <= depth_top)
+
+    # ---------- ESCALA COMÚN
+    lbl = (label or "").lower()
+    is_chi = ("susc" in lbl) or ("χ" in lbl) or ("suscept" in lbl)
+    lo_phys = CHI_MIN if is_chi else RHO_MIN
+    hi_phys = CHI_MAX if is_chi else RHO_MAX
+
+    # Si el usuario/proceso pasa una escala explícita, se respeta.
+    if (vmin is not None) and (vmax is not None):
+        vmin = float(vmin)
+        vmax = float(vmax)
+    else:
+        vals_all = np.r_[m0[np.isfinite(m0)], mrec[np.isfinite(mrec)]]
+        if vals_all.size > 0:
+            qlo, qhi = np.nanpercentile(vals_all, [0.1, 99.9])
+            vmin = max(lo_phys, float(min(qlo, np.nanmin(m0))))
+            vmax = min(hi_phys, float(max(qhi, np.nanmax(m0))))
+            if not (vmax > vmin):
+                vmax = vmin + 1e-6
+            if (vmax - vmin) < (0.05 if not is_chi else 1e-3):
+                mid = 0.5*(vmax + vmin)
+                span = 0.05 if not is_chi else 1e-3
+                vmin = max(lo_phys, mid - span)
+                vmax = min(hi_phys, mid + span)
+        else:
+            vmin, vmax = lo_phys, hi_phys
+    # ---------------------------------------
+
+    fig = plt.figure(figsize=(16, 18))
+    gs = fig.add_gridspec(2, 2)
+
+    ax1 = fig.add_subplot(gs[0, 0])
+    im1 = ax1.imshow(
+        m0_3D[:, :, z_idx].T,
+        extent=[xs.min(), xs.max(), ys.min(), ys.max()],
+        origin="lower", cmap="viridis", vmin=vmin, vmax=vmax
+    )
+    ax1.set_title(f"Corte Horizontal @ Z = {zlev:.1f} m (Inicial)")
+    plt.colorbar(im1, ax=ax1, label=label)
+
+    ax2 = fig.add_subplot(gs[0, 1])
+    im2 = ax2.imshow(
+        mr_3D[:, :, z_idx].T,
+        extent=[xs.min(), xs.max(), ys.min(), ys.max()],
+        origin="lower", cmap="viridis", vmin=vmin, vmax=vmax
+    )
+    ax2.set_title(f"Corte Horizontal @ Z = {zlev:.1f} m (Recuperado)")
+    plt.colorbar(im2, ax=ax2, label=label)
+
+    ax3 = fig.add_subplot(gs[1, 0])
+    im3 = ax3.imshow(
+        m0_3D[:, y_idx, :].T[z_mask, :],
+        extent=[xs.min(), xs.max(), depth_bottom, depth_top],
+        origin="lower", cmap="viridis", aspect="auto", vmin=vmin, vmax=vmax
+    )
+    ax3.set_title(f"Corte Vertical @ Y = {ylev:.1f} m (Inicial)")
+    plt.colorbar(im3, ax=ax3, label=label)
+
+    ax4 = fig.add_subplot(gs[1, 1])
+    im4 = ax4.imshow(
+        mr_3D[:, y_idx, :].T[z_mask, :],
+        extent=[xs.min(), xs.max(), depth_bottom, depth_top],
+        origin="lower", cmap="viridis", aspect="auto", vmin=vmin, vmax=vmax
+    )
+    ax4.set_title(f"Corte Vertical @ Y = {ylev:.1f} m (Recuperado)")
+    plt.colorbar(im4, ax=ax4, label=label)
+
+    plt.tight_layout()
+    plt.show()
+    return (z_idx, y_idx, depth_top, depth_bottom)
+
+def _plot_model_3d(
+    mesh, active, m_init, m_rec, label,
+    vmin=None, vmax=None, alpha=0.8, stride=(1, 1, 1)
+):
+    # 3D con **escala común** en ambos paneles
+    shape = mesh.shape_cells
+    m0_3D = np.full(shape, np.nan, order="F")
+    mr_3D = np.full(shape, np.nan, order="F")
+    act_idx = np.where(active)[0]
+    act_idx_3D = np.unravel_index(act_idx, shape, order="F")
+    m0_3D[act_idx_3D] = m_init
+    mr_3D[act_idx_3D] = m_rec
+
+    sx, sy, sz = stride
+    m0_3D = m0_3D[::sx, ::sy, ::sz]
+    mr_3D = mr_3D[::sx, ::sy, ::sz]
+
+    xe = mesh.nodes_x[::sx]; ye = mesh.nodes_y[::sy]; ze = mesh.nodes_z[::sz]
+    X, Y, Z = np.meshgrid(xe, ye, ze, indexing="ij")
+
+    # ---------- ESCALA COMÚN
+    is_chi = ("susc" in (label or "").lower()) or ("χ" in (label or "").lower()) or ("suscept" in (label or "").lower())
+    lo_phys, hi_phys = (CHI_MIN, CHI_MAX) if is_chi else (RHO_MIN, RHO_MAX)
+
+    if (vmin is not None) and (vmax is not None):
+        vmin_c = float(vmin)
+        vmax_c = float(vmax)
+    else:
+        vals_all = np.r_[m_init[np.isfinite(m_init)], m_rec[np.isfinite(m_rec)]]
+        if vals_all.size > 0:
+            qlo, qhi = np.nanpercentile(vals_all, [0.1, 99.9])
+            vmin_c = max(lo_phys, float(min(qlo, np.nanmin(m_init))))
+            vmax_c = min(hi_phys, float(max(qhi, np.nanmax(m_init))))
+            if not (vmax_c > vmin_c):
+                vmax_c = vmin_c + 1e-6
+            if (vmax_c - vmin_c) < (0.05 if not is_chi else 1e-3):
+                mid = 0.5*(vmax_c + vmin_c)
+                span = 0.05 if not is_chi else 1e-3
+                vmin_c = max(lo_phys, mid - span)
+                vmax_c = min(hi_phys, mid + span)
+        else:
+            vmin_c, vmax_c = lo_phys, hi_phys
+    # ---------------------------------------
+
+    cmap = cm.get_cmap("viridis")
+    norm_common = colors.Normalize(vmin=vmin_c, vmax=vmax_c)
+    sm = cm.ScalarMappable(norm=norm_common, cmap=cmap); sm.set_array([])
+
+    def _colorize(vol):
+        filled = ~np.isnan(vol)
+        rgba = cmap(norm_common(np.where(filled, vol, np.nan)))
+        rgba[..., 3] = np.where(filled, alpha, 0.0)
+        return filled, rgba
+
+    filled0, fc0 = _colorize(m0_3D)
+    filledR, fcR = _colorize(mr_3D)
+
+    fig = plt.figure(figsize=(14, 6))
+
+    ax1 = fig.add_subplot(121, projection="3d")
+    ax1.voxels(X, Y, Z, filled0, facecolors=fc0, edgecolor="none")
+    ax1.set_title(f"Inicial – {label}")
+    ax1.set_xlabel("X"); ax1.set_ylabel("Y"); ax1.set_zlabel("Z")
+    fig.colorbar(sm, ax=ax1, fraction=0.046, pad=0.04, label=label)
+
+    ax2 = fig.add_subplot(122, projection="3d")
+    ax2.voxels(X, Y, Z, filledR, facecolors=fcR, edgecolor="none")
+    ax2.set_title(f"Recuperado – {label}")
+    ax2.set_xlabel("X"); ax2.set_ylabel("Y"); ax2.set_zlabel("Z")
+    fig.colorbar(sm, ax=ax2, fraction=0.046, pad=0.04, label=label)
+
+    plt.tight_layout()
+    plt.show()
+
+# =========================
+# CELDA DE CONFIGURACIÓN / EJECUCIÓN
+# =========================
+
+BASE = "/content/drive/MyDrive/Tesis"
+
+# Carpeta donde se guardan PNG/CSV de observado-predicho-residual
+MISFIT_OUTPUT_DIR = os.path.join(BASE, "misfit_observado_predicho_residual")
+
+DEM  = os.path.join(BASE, "DEM_Machin_limite.tif")
+GRAV = os.path.join(BASE, "Gravimetría_VCM.xlsx")
+
+MAG_GRAD_FILES = [
+    os.path.join(BASE, "gradientes_filtrado_1.csv"),
+    os.path.join(BASE, "gradientes_filtrado_2.csv"),
+    os.path.join(BASE, "gradientes_filtrado_3.csv"),
+    os.path.join(BASE, "gradientes_filtrado_4.csv"),
+    os.path.join(BASE, "gradientes_filtrado_5.csv"),
+]
+MAG_GRAD_FILE  = None
+MAG_COMPONENTS = None  # None => usa bxx, byy, bzz si existen
+
+shapefiles = {
+    "unidades": os.path.join(BASE, "unidades_sin_flujos.shp"),
+    "flujos"  : os.path.join(BASE, "flujos_sin_recortes.shp"),
+    "crater"  : os.path.join(BASE, "crater_fixed.shp"),
+    "domo"    : os.path.join(BASE, "domo_fixed.shp"),
+}
+
+zone_props = {
+    "background": 2.9,
+
+    # Fondo de susceptibilidad usado cuando no hay prior CSV.
+    # Estos valores pequeños son para semillar χ en el mismo rango visual de la figura bonita.
+    "background_chi": 0.01,
+
+    "unidades"  : {"dens": 2.9,  "chi": 0.010},
+    "flujos"    : {"dens": 1.8,  "chi": 0.000},
+    "crater"    : {"dens": 1.95, "chi": -0.040},
+    "domo"      : {"dens": 2.5,  "chi": 0.050},
+    "under_dome": {"dens": 1.9,  "chi": -0.020},
+}
+
+# Cortes fijos. Para reproducir la figura bonita de susceptibilidad usa Z=2025 m.
+USE_FIXED_CUTS = True
+Z_CUT = 2025.0
+Y_CUT = 496105.1
+FIXED_SLICES = (Z_CUT, Y_CUT)
+
+# Campo magnético
+B0, INC, DEC = 30055.6, 26.78927, -7.63654
+
+# Modelo previo sintético (toggle)
+USE_PRIOR = False
+if USE_PRIOR:
+    SYN_MODELS_DIR = os.path.join(BASE, "Sinteticos")
+    PRIOR_MODEL    = os.path.join(SYN_MODELS_DIR, "falla_normal", "modelo_mesh.csv")
+else:
+    PRIOR_MODEL    = None
+
+# Pesos de referencia
+PRIOR_REF_WEIGHT_RHO = 0.30
+PRIOR_REF_WEIGHT_CHI = 0.30
+
+# Alineación del PREVIO
+PRIOR_SRC_CRS         = None
+PRIOR_ROT_DEG         = 0.0
+PRIOR_XY_SHIFT        = (0.0, 0.0)
+PRIOR_Z_IS_DEPTH      = True
+PRIOR_Z_OFFSET        = 0.0
+PRIOR_DEPTH_REFERENCE = "flat"
+PRIOR_REF_ELEV        = 1800
+
+ESTIMAR_SHIFT_AUTO = True
+if USE_PRIOR and (PRIOR_MODEL is not None) and os.path.isfile(PRIOR_MODEL) and ESTIMAR_SHIFT_AUTO:
+    if PRIOR_SRC_CRS is None:
+        PRIOR_ROT_DEG, PRIOR_XY_SHIFT = auto_align_prior_xy(PRIOR_MODEL, DEM, GRAV)
+    else:
+        PRIOR_ROT_DEG, PRIOR_XY_SHIFT = auto_align_prior_xy(PRIOR_MODEL, DEM, GRAV, src_crs=PRIOR_SRC_CRS)
+
+print("USE_PRIOR        :", USE_PRIOR)
+print("PRIOR_MODEL      :", PRIOR_MODEL)
+print("PRIOR_SRC_CRS    :", PRIOR_SRC_CRS)
+print("PRIOR_ROT_DEG    :", PRIOR_ROT_DEG)
+print("PRIOR_XY_SHIFT   :", PRIOR_XY_SHIFT)
+print("PRIOR_Z_IS_DEPTH :", PRIOR_Z_IS_DEPTH)
+print("PRIOR_Z_OFFSET   :", PRIOR_Z_OFFSET)
+print("FIXED_SLICES     :", FIXED_SLICES if USE_FIXED_CUTS else None)
+print("PLOT_MISFIT      :", PLOT_MISFIT)
+print("SAVE_MISFIT      :", SAVE_MISFIT)
+print("MISFIT_OUTPUT_DIR:", MISFIT_OUTPUT_DIR)
+
+# Interruptores de corrida
+# Para revisar primero la gradiometría, puedes dejar solo RUN_MAG_GRADIOMETRY = False.
+RUN_GRAVITY = False
+RUN_MAG_GRADIOMETRY = False
+RUN_JOINT = True
+
+rho_src = "prior" if USE_PRIOR else "shapes"
+
+if RUN_GRAVITY:
+    print("\n=== GRAVITY ===")
+    res_grav = invert_with_options(
+        dem_file=DEM, grav_file=GRAV, shapefiles=shapefiles, zone_props=zone_props,
+        dh=150., nz=40, z_top=3000., inv_type="gravity",
+        prior_model_file=(PRIOR_MODEL if USE_PRIOR else None),
+        prior_model_property="densidad",
+        prior_depth_reference=PRIOR_DEPTH_REFERENCE,
+        prior_ref_elev=PRIOR_REF_ELEV,
+        fixed_slices=(FIXED_SLICES if USE_FIXED_CUTS else None),
+        rho_init_source=rho_src
+    )
+
+if RUN_MAG_GRADIOMETRY:
+    print("\n=== MAG_GRADIOMETRY ===")
+    res_mag = invert_with_options(
+        dem_file=DEM, grav_file=GRAV, shapefiles=shapefiles, zone_props=zone_props,
+        dh=150., nz=40, z_top=3000., inv_type="mag_gradiometry",
+        prior_model_file=(PRIOR_MODEL if USE_PRIOR else None),
+        prior_model_property="susceptibilidad",
+        prior_depth_reference=PRIOR_DEPTH_REFERENCE,
+        prior_ref_elev=PRIOR_REF_ELEV,
+        mag_grad_file=MAG_GRAD_FILE,
+        mag_grad_files=MAG_GRAD_FILES,
+        mag_components=MAG_COMPONENTS,
+        B0=B0, inc=INC, dec=DEC,
+        fixed_slices=(FIXED_SLICES if USE_FIXED_CUTS else None),
+        rho_init_source="background"
+    )
+
+if RUN_JOINT:
+    print("\n=== JOINT ===")
+    res_joint = invert_with_options(
+        dem_file=DEM, grav_file=GRAV, shapefiles=shapefiles, zone_props=zone_props,
+        dh=150., nz=40, z_top=3000., inv_type="joint",
+        prior_model_file=(PRIOR_MODEL if USE_PRIOR else None),
+        prior_model_property=("both" if USE_PRIOR else "densidad"),
+        prior_depth_reference=PRIOR_DEPTH_REFERENCE,
+        prior_ref_elev=PRIOR_REF_ELEV,
+        mag_grad_file=MAG_GRAD_FILE,
+        mag_grad_files=MAG_GRAD_FILES,
+        mag_components=MAG_COMPONENTS,
+        B0=B0, inc=INC, dec=DEC,
+        fixed_slices=(FIXED_SLICES if USE_FIXED_CUTS else None),
+        rho_init_source=("prior" if USE_PRIOR else "shapes")
+    )

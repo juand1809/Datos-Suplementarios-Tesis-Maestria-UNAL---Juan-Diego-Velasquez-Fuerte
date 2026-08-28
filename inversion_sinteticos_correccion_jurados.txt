@@ -1,0 +1,1191 @@
+# ====== Funciones – Inversión sintética (gravity | mag_gradiometry | joint) ======
+# Requisitos: discretize, SimPEG, numpy, pandas, matplotlib, scipy
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.tri as mtri
+from matplotlib import cm, colors
+from discretize import TensorMesh
+from discretize.utils import active_from_xyz
+from scipy.spatial import cKDTree
+from simpeg import maps, data, data_misfit, regularization, optimization, directives, inverse_problem, inversion
+from simpeg.potential_fields import gravity, magnetics
+
+# =========================
+# Estilo de figuras para tesis (layout estable)
+# =========================
+# Esta versión aumenta la legibilidad sin montar títulos ni colorbars.
+FIG_DPI = 300
+FS_TITLE = 20
+FS_SUBTITLE = 16
+FS_AXIS = 14
+FS_TICKS = 11
+FS_CBAR = 12
+FS_LEGEND = 11
+FIGSIZE_COMPARE = (18, 13)
+FIGSIZE_MISFIT = (18, 6.5)
+FIGSIZE_3D = (18, 8)
+
+# Escala fija recomendada para modelos sintéticos de densidad tipo "multicuerpos".
+# Evita que los cuerpos laterales densos se camuflen con el fondo por el recorte percentil 2–98.
+# Si usas otro escenario con otro rango de densidades, puedes cambiar estos valores
+# o poner USE_FIXED_DENSITY_SCALE_FOR_SYNTHETICS = False.
+USE_FIXED_DENSITY_SCALE_FOR_SYNTHETICS = True
+SYNTHETIC_DENSITY_VMIN = 2.45
+SYNTHETIC_DENSITY_VMAX = 2.75
+
+# Escala fija recomendada para susceptibilidad sintética tipo "multicuerpos".
+# Esta escala reproduce mejor el contraste usado en la figura original de la tesis
+# y evita que pequeñas variaciones del recuperado se vean exageradas.
+USE_FIXED_CHI_SCALE_FOR_SYNTHETICS = True
+SYNTHETIC_CHI_VMIN = -0.03
+SYNTHETIC_CHI_VMAX = 0.07
+
+plt.rcParams.update({
+    "figure.dpi": FIG_DPI,
+    "savefig.dpi": FIG_DPI,
+    "axes.titlesize": FS_SUBTITLE,
+    "axes.labelsize": FS_AXIS,
+    "xtick.labelsize": FS_TICKS,
+    "ytick.labelsize": FS_TICKS,
+    "legend.fontsize": FS_LEGEND,
+    "font.size": FS_AXIS,
+    "axes.linewidth": 1.1,
+    "xtick.major.width": 1.0,
+    "ytick.major.width": 1.0,
+    "xtick.major.size": 4.5,
+    "ytick.major.size": 4.5,
+    "axes.titlepad": 8.0,
+})
+
+def _finite_values(*arrays):
+    vals = []
+    for arr in arrays:
+        a = np.asarray(arr, dtype=float).ravel()
+        a = a[np.isfinite(a)]
+        if a.size:
+            vals.append(a)
+    return np.r_[tuple(vals)] if vals else np.array([], dtype=float)
+
+
+def _shared_color_limits(a, b=None, pmin=2, pmax=98, symmetric=False, fallback=(0.0, 1.0)):
+    """Límites comunes robustos para comparar modelo inicial y recuperado."""
+    vals = _finite_values(a, b) if b is not None else _finite_values(a)
+    if vals.size == 0:
+        return fallback
+    if symmetric:
+        lim = float(np.nanpercentile(np.abs(vals), pmax))
+        if not np.isfinite(lim) or lim <= 0:
+            lim = max(float(np.nanmax(np.abs(vals))), 1.0)
+        return -lim, lim
+    lo, hi = np.nanpercentile(vals, [pmin, pmax])
+    lo, hi = float(lo), float(hi)
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo, hi = float(np.nanmin(vals)), float(np.nanmax(vals))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            span = max(abs(lo), 1.0) * 0.05
+            lo, hi = lo - span, lo + span
+    return lo, hi
+
+
+def _format_axis_2d(ax, xlabel="X (m)", ylabel="Y (m)", equal=True):
+    ax.set_xlabel(xlabel, fontsize=FS_AXIS, labelpad=10)
+    ax.set_ylabel(ylabel, fontsize=FS_AXIS, labelpad=10)
+    ax.tick_params(axis="both", labelsize=FS_TICKS, width=1.4, length=6)
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.4)
+    if equal:
+        ax.set_aspect("equal", adjustable="box")
+
+
+def _add_colorbar(fig, mappable, ax, label):
+    cb = fig.colorbar(mappable, ax=ax, fraction=0.046, pad=0.035)
+    cb.set_label(label, fontsize=FS_CBAR, labelpad=12)
+    cb.ax.tick_params(labelsize=FS_TICKS, width=1.2, length=5)
+    cb.outline.set_linewidth(1.2)
+    return cb
+
+
+def _format_3d_axis(ax, title):
+    ax.set_title(title, fontsize=FS_TITLE, pad=26)
+    ax.set_xlabel("X (m)", fontsize=FS_AXIS, labelpad=16)
+    ax.set_ylabel("Y (m)", fontsize=FS_AXIS, labelpad=16)
+    ax.set_zlabel("Z (m)", fontsize=FS_AXIS, labelpad=16)
+    ax.tick_params(axis="both", which="major", labelsize=FS_TICKS, pad=7)
+    try:
+        ax.tick_params(axis="z", labelsize=FS_TICKS, pad=7)
+    except Exception:
+        pass
+    try:
+        ax.set_box_aspect(None, zoom=0.88)
+    except Exception:
+        pass
+
+
+def _flat_topo_xyz(xmin, xmax, ymin, ymax, z_top, nx=25, ny=25):
+    xs = np.linspace(xmin, xmax, nx)
+    ys = np.linspace(ymin, ymax, ny)
+    X, Y = np.meshgrid(xs, ys, indexing="xy")
+    Z = np.full_like(X, float(z_top))
+    return np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
+
+def build_mesh_and_active_flat(xyz, dh=150., nz=40, z_top=None, pad=0.0, strip_top_layers=0):
+    x0, x1 = float(xyz[:,0].min()) - pad, float(xyz[:,0].max()) + pad
+    y0, y1 = float(xyz[:,1].min()) - pad, float(xyz[:,1].max()) + pad
+    if z_top is None:
+        z_top = float(np.nanmax(xyz[:,2])) + 0.5*dh
+    nx = int(np.ceil((x1-x0)/dh))
+    ny = int(np.ceil((y1-y0)/dh))
+    z0 = z_top - dh*nz
+
+    mesh = TensorMesh([[dh]*nx, [dh]*ny, [dh]*nz], x0=[x0, y0, z0])
+    topo_xyz = _flat_topo_xyz(x0, x1, y0, y1, z_top)
+    active = active_from_xyz(mesh, topo_xyz)
+
+    if strip_top_layers and strip_top_layers > 0:
+        CC = mesh.gridCC
+        h_z_min = float(np.min(np.atleast_1d(mesh.h[2])))
+        z_thresh = np.max(mesh.cell_centers_z) - strip_top_layers * h_z_min
+        active = active & (CC[:,2] < z_thresh)
+    return mesh, active, topo_xyz
+
+# ---------------- Utilidades de cortes/colores ----------------
+
+def _select_auto_slices(mesh, active, ref_vec, bg=None):
+    shape = mesh.shape_cells
+    vol = np.full(shape, np.nan, order="F")
+    act_idx = np.where(active)[0]
+    act_idx3 = np.unravel_index(act_idx, shape, order="F")
+    vol[act_idx3] = ref_vec
+    if bg is not None:
+        vol = np.abs(vol - bg)
+    z_idx = int(np.nanargmax(np.nanmean(vol, axis=(0,1))))
+    y_idx = int(np.nanargmax(np.nanmean(vol, axis=(0,2))))
+    zs = mesh.cell_centers_z
+    return (z_idx, y_idx, float(np.max(zs)), float(np.min(zs)))
+
+
+def _resolve_slices_to_indices(fixed_slices, ys, zs):
+    """
+    Convierte cortes fijos a índices de la malla.
+
+    Acepta dos formatos:
+    1) Índices ya calculados: (z_idx, y_idx, depth_top, depth_bottom).
+       Este es el formato que devuelve _select_auto_slices.
+    2) Coordenadas físicas: (z_cut, y_cut, depth_top, depth_bottom).
+       Ejemplo: z_cut=-300.0 m.
+
+    Esto evita el error de intentar usar una profundidad física, por ejemplo -300.0,
+    como si fuera un índice de Python.
+    """
+    z_raw, y_raw, depth_top, depth_bottom = fixed_slices
+
+    z_is_index = isinstance(z_raw, (int, np.integer)) and 0 <= int(z_raw) < len(zs)
+    y_is_index = isinstance(y_raw, (int, np.integer)) and 0 <= int(y_raw) < len(ys)
+
+    if z_is_index and y_is_index:
+        z_idx = int(z_raw)
+        y_idx = int(y_raw)
+    else:
+        z_cut = float(z_raw)
+        y_cut = float(y_raw)
+        z_idx = int(np.argmin(np.abs(zs - z_cut)))
+        y_idx = int(np.argmin(np.abs(ys - y_cut)))
+
+    if depth_top is None:
+        depth_top = float(np.max(zs))
+    if depth_bottom is None:
+        depth_bottom = float(np.min(zs))
+
+    return z_idx, y_idx, float(depth_top), float(depth_bottom)
+
+def _robust_limits(arr, low=2, high=98, pad=0.05):
+    a = np.asarray(arr); a = a[np.isfinite(a)]
+    if a.size == 0: return 0.0, 1.0
+    lo, hi = np.percentile(a, [low, high])
+    span = hi - lo if hi > lo else max(abs(hi), 1.0)
+    return float(lo - pad*span), float(hi + pad*span)
+
+# ---------------- Plots 2D (con fix de “barra blanca” en vertical) ----------------
+
+def _plot_density_results(
+    mesh, active, m0, rho_rec, topo_xyz, xyz, bg_val,
+    fixed_slices=None, slice_source="recovered"
+):
+    xs, ys, zs = mesh.cell_centers_x, mesh.cell_centers_y, mesh.cell_centers_z
+    shape = mesh.shape_cells
+
+    dens0_3D = np.full(shape, np.nan, order="F")
+    densR_3D = np.full(shape, np.nan, order="F")
+    act_idx = np.where(active)[0]
+    act_idx3 = np.unravel_index(act_idx, shape, order="F")
+    dens0_3D[act_idx3] = m0
+    densR_3D[act_idx3] = rho_rec
+
+    if fixed_slices is None:
+        base = rho_rec if slice_source.lower().startswith("rec") else m0
+        z_idx, y_idx, depth_top, depth_bottom = _select_auto_slices(mesh, active, base, bg=bg_val)
+    else:
+        z_idx, y_idx, depth_top, depth_bottom = _resolve_slices_to_indices(fixed_slices, ys, zs)
+
+    zlev, ylev = zs[z_idx], ys[y_idx]
+    z_mask = (zs >= depth_bottom) & (zs <= depth_top)
+
+    if USE_FIXED_DENSITY_SCALE_FOR_SYNTHETICS:
+        vmin, vmax = float(SYNTHETIC_DENSITY_VMIN), float(SYNTHETIC_DENSITY_VMAX)
+    else:
+        vmin, vmax = _shared_color_limits(m0, rho_rec, pmin=2, pmax=98)
+
+    fig = plt.figure(figsize=FIGSIZE_COMPARE, constrained_layout=False)
+    gs = fig.add_gridspec(2, 2)
+
+    panels = [
+        (fig.add_subplot(gs[0, 0]), dens0_3D[:, :, z_idx].T, [xs.min(), xs.max(), ys.min(), ys.max()],
+         f"Corte horizontal inicial | Z = {zlev:.1f} m", "Y (m)", True),
+        (fig.add_subplot(gs[0, 1]), densR_3D[:, :, z_idx].T, [xs.min(), xs.max(), ys.min(), ys.max()],
+         f"Corte horizontal recuperado | Z = {zlev:.1f} m", "Y (m)", True),
+        (fig.add_subplot(gs[1, 0]), dens0_3D[:, y_idx, :].T[z_mask, :], [xs.min(), xs.max(), depth_bottom, depth_top],
+         f"Corte vertical inicial | Y = {ylev:.1f} m", "Z (m)", False),
+        (fig.add_subplot(gs[1, 1]), densR_3D[:, y_idx, :].T[z_mask, :], [xs.min(), xs.max(), depth_bottom, depth_top],
+         f"Corte vertical recuperado | Y = {ylev:.1f} m", "Z (m)", False),
+    ]
+
+    for ax, img, extent, title, ylabel, equal in panels:
+        im = ax.imshow(img, extent=extent, origin="lower", cmap="viridis",
+                       vmin=vmin, vmax=vmax, aspect=("equal" if equal else "auto"), interpolation="nearest")
+        ax.set_title(title, fontsize=FS_SUBTITLE, pad=16)
+        _format_axis_2d(ax, ylabel=ylabel, equal=equal)
+        _add_colorbar(fig, im, ax, "Densidad (g/cc)")
+
+    for ax in [panels[0][0], panels[1][0]]:
+        ax.scatter(xyz[:,0], xyz[:,1], c="white", s=16, alpha=0.7,
+                   edgecolors="k", linewidths=0.3, label="Estaciones")
+        ax.legend(loc="best")
+
+    fig.suptitle("Comparación de modelo de densidad inicial y recuperado", fontsize=FS_TITLE, y=0.975)
+    fig.subplots_adjust(top=0.88, bottom=0.08, left=0.07, right=0.94, hspace=0.32, wspace=0.26)
+    plt.show()
+    return (z_idx, y_idx, depth_top, depth_bottom)
+
+
+def _plot_scalar_results(
+    mesh, active, m0, mrec, topo_xyz=None, label="Propiedad",
+    fixed_slices=None, bg=None, slice_source="recovered",
+    as_anomaly=False, anomaly_ref=0.0
+):
+    xs, ys, zs = mesh.cell_centers_x, mesh.cell_centers_y, mesh.cell_centers_z
+    shape = mesh.shape_cells
+
+    m0_3D = np.full(shape, np.nan, order="F")
+    mr_3D = np.full(shape, np.nan, order="F")
+    act_idx = np.where(active)[0]
+    act_idx3 = np.unravel_index(act_idx, shape, order="F")
+    m0_3D[act_idx3] = m0
+    mr_3D[act_idx3] = mrec
+
+    if fixed_slices is None:
+        ref = mrec if slice_source.lower().startswith("rec") else m0
+        z_idx, y_idx, depth_top, depth_bottom = _select_auto_slices(mesh, active, ref, bg=bg)
+    else:
+        z_idx, y_idx, depth_top, depth_bottom = _resolve_slices_to_indices(fixed_slices, ys, zs)
+
+    zlev, ylev = zs[z_idx], ys[y_idx]
+    z_mask = (zs >= depth_bottom) & (zs <= depth_top)
+
+    if as_anomaly:
+        rec_panel = mr_3D - float(anomaly_ref)
+        vmin, vmax = _shared_color_limits(rec_panel[np.isfinite(rec_panel)], symmetric=True)
+        cmap_rec = "RdBu_r"
+        label_rec = f"{label} - ref"
+    else:
+        rec_panel = mr_3D
+        if USE_FIXED_CHI_SCALE_FOR_SYNTHETICS and "Susceptibilidad" in str(label):
+            vmin, vmax = float(SYNTHETIC_CHI_VMIN), float(SYNTHETIC_CHI_VMAX)
+        else:
+            vmin, vmax = _shared_color_limits(m0, mrec, pmin=2, pmax=98)
+        cmap_rec = "viridis"
+        label_rec = label
+
+    fig = plt.figure(figsize=FIGSIZE_COMPARE, constrained_layout=False)
+    gs = fig.add_gridspec(2, 2)
+
+    panels = [
+        (fig.add_subplot(gs[0, 0]), m0_3D[:, :, z_idx].T, "viridis", vmin, vmax,
+         [xs.min(), xs.max(), ys.min(), ys.max()], f"Corte horizontal inicial | Z = {zlev:.1f} m", "Y (m)", True, label),
+        (fig.add_subplot(gs[0, 1]), rec_panel[:, :, z_idx].T, cmap_rec, vmin, vmax,
+         [xs.min(), xs.max(), ys.min(), ys.max()], f"Corte horizontal recuperado | Z = {zlev:.1f} m", "Y (m)", True, label_rec),
+        (fig.add_subplot(gs[1, 0]), m0_3D[:, y_idx, :].T[z_mask, :], "viridis", vmin, vmax,
+         [xs.min(), xs.max(), depth_bottom, depth_top], f"Corte vertical inicial | Y = {ylev:.1f} m", "Z (m)", False, label),
+        (fig.add_subplot(gs[1, 1]), rec_panel[:, y_idx, :].T[z_mask, :], cmap_rec, vmin, vmax,
+         [xs.min(), xs.max(), depth_bottom, depth_top], f"Corte vertical recuperado | Y = {ylev:.1f} m", "Z (m)", False, label_rec),
+    ]
+
+    for ax, img, cmap, lo, hi, extent, title, ylabel, equal, cblabel in panels:
+        im = ax.imshow(img, extent=extent, origin="lower", cmap=cmap, vmin=lo, vmax=hi,
+                       aspect=("equal" if equal else "auto"), interpolation="nearest")
+        ax.set_title(title, fontsize=FS_SUBTITLE, pad=16)
+        _format_axis_2d(ax, ylabel=ylabel, equal=equal)
+        _add_colorbar(fig, im, ax, cblabel)
+
+    fig.suptitle(f"Comparación de {label}: modelo inicial y recuperado", fontsize=FS_TITLE, y=0.975)
+    fig.subplots_adjust(top=0.88, bottom=0.08, left=0.07, right=0.94, hspace=0.32, wspace=0.26)
+    plt.show()
+    return (z_idx, y_idx, depth_top, depth_bottom)
+
+
+def _plot_model_3d(
+    mesh, active, m_init, m_rec, label,
+    vmin=None, vmax=None, alpha=1.0, stride=(1,1,1),
+    plot_strip_top_layers=0
+):
+    shape = mesh.shape_cells
+    m0_3D = np.full(shape, np.nan, order="F")
+    mr_3D = np.full(shape, np.nan, order="F")
+    act_idx = np.where(active)[0]
+    i3d = np.unravel_index(act_idx, shape, order="F")
+    m0_3D[i3d] = m_init
+    mr_3D[i3d] = m_rec
+
+    sx, sy, sz = stride
+    m0_3D = m0_3D[::sx, ::sy, ::sz]
+    mr_3D = mr_3D[::sx, ::sy, ::sz]
+
+    xe = mesh.nodes_x[::sx]; ye = mesh.nodes_y[::sy]; ze = mesh.nodes_z[::sz]
+    if len(xe) != m0_3D.shape[0] + 1: xe = np.r_[xe, mesh.nodes_x[-1]]
+    if len(ye) != m0_3D.shape[1] + 1: ye = np.r_[ye, mesh.nodes_y[-1]]
+    if len(ze) != m0_3D.shape[2] + 1: ze = np.r_[ze, mesh.nodes_z[-1]]
+    X, Y, Z = np.meshgrid(xe, ye, ze, indexing="ij")
+
+    if vmin is None or vmax is None:
+        vmin_g, vmax_g = _shared_color_limits(m_init, m_rec, pmin=2, pmax=98)
+    else:
+        vmin_g, vmax_g = float(vmin), float(vmax)
+
+    cmap = cm.get_cmap("viridis")
+    norm = colors.Normalize(vmin=vmin_g, vmax=vmax_g)
+
+    f0 = ~np.isnan(m0_3D); c0 = cmap(norm(np.where(f0, m0_3D, np.nan))); c0[..., 3] = np.where(f0, float(alpha), 0.0)
+    fR = ~np.isnan(mr_3D); cR = cmap(norm(np.where(fR, mr_3D, np.nan))); cR[..., 3] = np.where(fR, float(alpha), 0.0)
+
+    if plot_strip_top_layers and plot_strip_top_layers > 0:
+        k = max(0, int(plot_strip_top_layers))
+        k = min(k, f0.shape[2])
+        if k > 0:
+            f0[:, :, -k:] = False
+            fR[:, :, -k:] = False
+
+    sm = cm.ScalarMappable(norm=norm, cmap=cmap); sm.set_array([])
+
+    fig = plt.figure(figsize=FIGSIZE_3D)
+    ax1 = fig.add_subplot(121, projection="3d"); ax1.voxels(X, Y, Z, f0, facecolors=c0, edgecolor="none")
+    _format_3d_axis(ax1, f"Modelo inicial – {label}")
+    cb1 = fig.colorbar(sm, ax=ax1, fraction=0.046, pad=0.06)
+    cb1.set_label(label, fontsize=FS_CBAR, labelpad=12); cb1.ax.tick_params(labelsize=FS_TICKS, width=1.2, length=5); cb1.outline.set_linewidth(1.2)
+
+    ax2 = fig.add_subplot(122, projection="3d"); ax2.voxels(X, Y, Z, fR, facecolors=cR, edgecolor="none")
+    _format_3d_axis(ax2, f"Modelo recuperado – {label}")
+    cb2 = fig.colorbar(sm, ax=ax2, fraction=0.046, pad=0.06)
+    cb2.set_label(label, fontsize=FS_CBAR, labelpad=12); cb2.ax.tick_params(labelsize=FS_TICKS, width=1.2, length=5); cb2.outline.set_linewidth(1.2)
+
+    fig.suptitle(f"Visualización 3D con escala de color compartida ({label})", fontsize=FS_TITLE, y=0.995)
+    plt.tight_layout(); plt.show()
+
+
+def _misfit_metrics(dobs, dpred, standard_deviation=None):
+    """Calcula estadísticos del ajuste; residual = observado - predicho."""
+    dobs = np.asarray(dobs, dtype=float).ravel()
+    dpred = np.asarray(dpred, dtype=float).ravel()
+    if dobs.size != dpred.size:
+        raise ValueError("dobs y dpred deben tener el mismo número de datos.")
+
+    residual = dobs - dpred
+    if standard_deviation is None:
+        sigma0 = float(np.nanstd(residual))
+        sigma0 = sigma0 if np.isfinite(sigma0) and sigma0 > 0 else 1.0
+        sigma = np.full_like(residual, sigma0)
+    else:
+        sigma = np.broadcast_to(np.asarray(standard_deviation, dtype=float), residual.shape).copy()
+        valid_sigma = np.isfinite(sigma) & (sigma > 0)
+        fallback = float(np.nanmedian(sigma[valid_sigma])) if np.any(valid_sigma) else 1.0
+        sigma[~valid_sigma] = fallback
+
+    normalized = residual / sigma
+    valid = np.isfinite(dobs) & np.isfinite(dpred) & np.isfinite(normalized)
+    if not np.any(valid):
+        raise ValueError("No hay valores finitos para calcular el misfit.")
+
+    r = residual[valid]
+    rn = normalized[valid]
+    metrics = {
+        "n_data": int(valid.sum()),
+        "rmse": float(np.sqrt(np.mean(r**2))),
+        "mae": float(np.mean(np.abs(r))),
+        "bias_obs_minus_pred": float(np.mean(r)),
+        "rms_normalized": float(np.sqrt(np.mean(rn**2))),
+        "phi_d": float(0.5 * np.sum(rn**2)),
+    }
+    return residual, normalized, sigma, metrics
+
+
+def _robust_color_limits(values_a, values_b=None):
+    arr = np.asarray(values_a, dtype=float).ravel()
+    if values_b is not None:
+        arr = np.r_[arr, np.asarray(values_b, dtype=float).ravel()]
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return -1.0, 1.0
+    lo, hi = np.nanpercentile(arr, [2, 98])
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        center = float(np.nanmean(arr)) if arr.size else 0.0
+        span = max(float(np.nanmax(np.abs(arr - center))), 1.0)
+        return center - span, center + span
+    return float(lo), float(hi)
+
+
+def _symmetric_limit(values, percentile=98.0, minimum=1e-12):
+    arr = np.asarray(values, dtype=float).ravel()
+    arr = np.abs(arr[np.isfinite(arr)])
+    if arr.size == 0:
+        return 1.0
+    lim = float(np.nanpercentile(arr, percentile))
+    return lim if np.isfinite(lim) and lim > minimum else 1.0
+
+
+def _prepare_full_extent_grid(
+    xyz, map_extent=None, grid_shape=(180, 180), max_plot_points=12000
+):
+    """
+    Prepara una grilla regular para dibujar el misfit en toda la extensión.
+    Solo limita puntos para la superficie visual; métricas y CSV conservan todos.
+    """
+    xyz = np.asarray(xyz, dtype=float)
+    valid = np.isfinite(xyz[:, 0]) & np.isfinite(xyz[:, 1])
+    source_idx = np.where(valid)[0]
+    xy = xyz[source_idx, :2]
+
+    if xy.shape[0] < 3:
+        return {"fallback": True, "source_idx": source_idx, "xy": xy}
+
+    # Quitar coordenadas XY repetidas para evitar fallas de triangulación.
+    _, keep = np.unique(xy, axis=0, return_index=True)
+    keep = np.sort(keep)
+    source_idx = source_idx[keep]
+    xy = xyz[source_idx, :2]
+
+    if max_plot_points is not None and xy.shape[0] > int(max_plot_points):
+        take = np.linspace(0, xy.shape[0] - 1, int(max_plot_points), dtype=int)
+        source_idx = source_idx[take]
+        xy = xyz[source_idx, :2]
+
+    if map_extent is None:
+        xmin, xmax = float(np.nanmin(xy[:, 0])), float(np.nanmax(xy[:, 0]))
+        ymin, ymax = float(np.nanmin(xy[:, 1])), float(np.nanmax(xy[:, 1]))
+    else:
+        xmin, xmax, ymin, ymax = [float(v) for v in map_extent]
+
+    nx, ny = int(grid_shape[0]), int(grid_shape[1])
+    gx = np.linspace(xmin, xmax, nx)
+    gy = np.linspace(ymin, ymax, ny)
+    GX, GY = np.meshgrid(gx, gy)
+
+    try:
+        triang = mtri.Triangulation(xy[:, 0], xy[:, 1])
+        tree = cKDTree(xy)
+        _, nearest = tree.query(np.c_[GX.ravel(), GY.ravel()], k=1)
+        return {
+            "fallback": False, "source_idx": source_idx, "xy": xy,
+            "GX": GX, "GY": GY, "triang": triang,
+            "nearest": nearest.reshape(GX.shape),
+            "extent": (xmin, xmax, ymin, ymax),
+        }
+    except Exception:
+        return {"fallback": True, "source_idx": source_idx, "xy": xy}
+
+
+def _surface_on_full_extent(values, plot_grid):
+    """
+    Interpolación lineal dentro de la cobertura de los datos y relleno nearest
+    fuera de ella, para visualizar toda la extensión solicitada.
+    """
+    z = np.asarray(values, dtype=float).ravel()[plot_grid["source_idx"]]
+    triang = plot_grid["triang"]
+
+    try:
+        linear = mtri.LinearTriInterpolator(triang, z)
+        masked_surface = linear(plot_grid["GX"], plot_grid["GY"])
+        if hasattr(masked_surface, "filled"):
+            surface = np.asarray(masked_surface.filled(np.nan), dtype=float)
+        else:
+            surface = np.asarray(masked_surface, dtype=float)
+    except Exception:
+        surface = np.full_like(plot_grid["GX"], np.nan, dtype=float)
+
+    nearest_surface = z[plot_grid["nearest"]]
+    surface = np.where(np.isfinite(surface), surface, nearest_surface)
+    return surface
+
+
+def _plot_contour_panel_full_extent(
+    fig, ax, xyz, values, title, cmap, lo, hi, cbar_label, plot_grid,
+    n_levels=18, show_points=True
+):
+    values = np.asarray(values, dtype=float).ravel()
+
+    if plot_grid.get("fallback", False):
+        idx = plot_grid.get("source_idx", np.arange(len(values)))
+        sc = ax.scatter(
+            xyz[idx, 0], xyz[idx, 1], c=values[idx], cmap=cmap, vmin=lo, vmax=hi,
+            s=30, edgecolors="k", linewidths=0.15
+        )
+        fig.colorbar(sc, ax=ax, label=cbar_label)
+    else:
+        surface = _surface_on_full_extent(values, plot_grid)
+        levels = np.linspace(float(lo), float(hi), int(n_levels))
+        cf = ax.contourf(
+            plot_grid["GX"], plot_grid["GY"], surface,
+            levels=levels, cmap=cmap, extend="both"
+        )
+        ax.contour(
+            plot_grid["GX"], plot_grid["GY"], surface,
+            levels=levels, colors="k", linewidths=0.32, alpha=0.32
+        )
+        fig.colorbar(cf, ax=ax, label=cbar_label)
+        xmin, xmax, ymin, ymax = plot_grid["extent"]
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+
+    if show_points:
+        idx = plot_grid.get("source_idx", np.arange(xyz.shape[0]))
+        ax.plot(xyz[idx, 0], xyz[idx, 1], "k.", ms=1.5, alpha=0.22)
+
+    ax.set_title(title)
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.set_aspect("equal", adjustable="box")
+
+
+def _get_final_dpred(invp, simulation, model, expected_size=None):
+    """Reutiliza la predicción final almacenada por la inversión; recalcula solo si no está disponible."""
+    cached = getattr(invp, "dpred", None)
+    if cached is not None:
+        try:
+            arr = np.asarray(cached, dtype=float).ravel()
+            if expected_size is None or arr.size == int(expected_size):
+                return arr.copy()
+        except Exception:
+            pass
+    return np.asarray(simulation.dpred(model), dtype=float).ravel()
+
+
+def _get_joint_final_dpred(invp, simulations, model, sizes):
+    """Recupera predicciones de un ajuste conjunto; acepta caché concatenada o por bloques."""
+    cached = getattr(invp, "dpred", None)
+    sizes = [int(n) for n in sizes]
+    if cached is not None:
+        if isinstance(cached, (list, tuple)) and len(cached) == len(sizes):
+            try:
+                blocks = [np.asarray(a, dtype=float).ravel() for a in cached]
+                if all(a.size == n for a, n in zip(blocks, sizes)):
+                    return [a.copy() for a in blocks]
+            except Exception:
+                pass
+        try:
+            arr = np.asarray(cached, dtype=float).ravel()
+            if arr.size == sum(sizes):
+                cuts = np.cumsum([0] + sizes)
+                return [arr[cuts[i]:cuts[i + 1]].copy() for i in range(len(sizes))]
+        except Exception:
+            pass
+    return [np.asarray(sim.dpred(model), dtype=float).ravel() for sim in simulations]
+
+
+def _plot_data_misfit(
+    xyz, dobs, dpred, standard_deviation, label, units,
+    output_dir=None, filename="misfit", map_extent=None,
+    grid_shape=(180, 180), plot_grid_cache=None
+):
+    """
+    Figura diagnóstica de ajuste de datos en puntos de medición:
+    observado, predicho y residual (= observado - predicho).
+    """
+    xyz = np.asarray(xyz, dtype=float)
+    residual, normalized, sigma, metrics = _misfit_metrics(dobs, dpred, standard_deviation)
+    dobs = np.asarray(dobs, dtype=float).ravel()
+    dpred = np.asarray(dpred, dtype=float).ravel()
+
+    valid = (
+        np.isfinite(xyz[:, 0]) & np.isfinite(xyz[:, 1]) &
+        np.isfinite(dobs) & np.isfinite(dpred) & np.isfinite(residual)
+    )
+
+    vmin, vmax = _shared_color_limits(dobs, dpred, pmin=2, pmax=98)
+    rlim = _symmetric_limit(residual)
+
+    fig, axes = plt.subplots(1, 3, figsize=FIGSIZE_MISFIT, constrained_layout=False)
+    panels = [
+        (dobs, "Dato observado", "viridis", vmin, vmax, units),
+        (dpred, "Dato predicho", "viridis", vmin, vmax, units),
+        (residual, "Residual (observado − predicho)", "RdBu_r", -rlim, rlim, f"Residual ({units})"),
+    ]
+
+    for ax, (values, title, cmap, lo, hi, cbar_label) in zip(axes, panels):
+        sc = ax.scatter(
+            xyz[valid, 0], xyz[valid, 1],
+            c=values[valid], cmap=cmap, vmin=lo, vmax=hi,
+            s=46, edgecolors="k", linewidths=0.30, alpha=0.95
+        )
+        ax.set_title(title, fontsize=FS_SUBTITLE, pad=16)
+        _format_axis_2d(ax)
+        if map_extent is not None:
+            xmin, xmax, ymin, ymax = [float(v) for v in map_extent]
+            ax.set_xlim(xmin, xmax)
+            ax.set_ylim(ymin, ymax)
+        _add_colorbar(fig, sc, ax, cbar_label)
+
+    fig.suptitle(
+        f"{label} | RMSE={metrics['rmse']:.4g} {units}   |   "
+        f"MAE={metrics['mae']:.4g} {units}   |   "
+        f"RMS normalizado={metrics['rms_normalized']:.3f}   |   "
+        f"$\\phi_d$={metrics['phi_d']:.2f}",
+        fontsize=FS_TITLE,
+        y=0.975
+    )
+    fig.subplots_adjust(top=0.78, bottom=0.14, left=0.055, right=0.96, wspace=0.34)
+
+    points = pd.DataFrame({
+        "X": xyz[:, 0], "Y": xyz[:, 1], "Z": xyz[:, 2],
+        "observed": dobs,
+        "predicted": dpred,
+        "residual_obs_minus_pred": residual,
+        "standard_deviation": sigma,
+        "normalized_residual": normalized,
+    })
+    metrics_table = pd.DataFrame([{"dataset": label, "units": units, **metrics}])
+
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        figure_file = os.path.join(output_dir, f"{filename}.png")
+        values_file = os.path.join(output_dir, f"{filename}_datos.csv")
+        metrics_file = os.path.join(output_dir, f"{filename}_metricas.csv")
+
+        fig.savefig(figure_file, dpi=FIG_DPI, bbox_inches="tight")
+        points.to_csv(values_file, index=False)
+        metrics_table.to_csv(metrics_file, index=False)
+
+        print(f"[misfit] Figura guardada          : {figure_file}")
+        print(f"[misfit] Datos guardados          : {values_file}")
+        print(f"[misfit] Métricas guardadas       : {metrics_file}")
+    else:
+        figure_file = values_file = metrics_file = None
+
+    print(f"\n[observado/predicho/residual] {label}")
+    print(metrics_table.to_string(index=False))
+    plt.show()
+
+    return {
+        "label": label,
+        "units": units,
+        "metrics": metrics,
+        "points": points,
+        "figure_file": figure_file,
+        "values_file": values_file,
+        "metrics_file": metrics_file,
+    }
+
+
+def _plot_magnetic_misfit(
+    xyz, components, dobs, dpred, standard_deviation,
+    output_dir=None, filename_prefix="misfit_mag",
+    map_extent=None, grid_shape=(180, 180)
+):
+    """Genera un mapa de puntos del residual de misfit para cada componente magnética."""
+    xyz = np.asarray(xyz, dtype=float)
+    components = list(components)
+    n_stations, n_components = xyz.shape[0], len(components)
+    obs_matrix = np.asarray(dobs, dtype=float).reshape((n_stations, n_components), order="C")
+    pred_matrix = np.asarray(dpred, dtype=float).reshape((n_stations, n_components), order="C")
+    std_matrix = np.asarray(standard_deviation, dtype=float).reshape((n_stations, n_components), order="C")
+
+    plot_grid_cache = _prepare_full_extent_grid(
+        xyz, map_extent=map_extent, grid_shape=grid_shape
+    )
+
+    component_results = {}
+    rows = []
+    for j, comp in enumerate(components):
+        result = _plot_data_misfit(
+            xyz=xyz,
+            dobs=obs_matrix[:, j],
+            dpred=pred_matrix[:, j],
+            standard_deviation=std_matrix[:, j],
+            label=f"Gradiente magnético {comp}",
+            units="nT/m",
+            output_dir=output_dir,
+            filename=f"{filename_prefix}_{comp}",
+            map_extent=map_extent,
+            grid_shape=grid_shape,
+            plot_grid_cache=plot_grid_cache,
+        )
+        component_results[comp] = result
+        rows.append({"component": comp, **result["metrics"]})
+
+    summary = pd.DataFrame(rows)
+    phi_d_total = float(summary["phi_d"].sum()) if len(summary) else 0.0
+    if output_dir is not None:
+        summary_file = os.path.join(output_dir, f"{filename_prefix}_resumen_metricas.csv")
+        summary.to_csv(summary_file, index=False)
+        print(f"[misfit] Resumen magnético guardado: {summary_file}")
+    else:
+        summary_file = None
+    print("\n[misfit] Resumen de gradiometría magnética")
+    print(summary.to_string(index=False))
+    return {
+        "components": component_results,
+        "metrics_table": summary,
+        "phi_d_total": phi_d_total,
+        "summary_file": summary_file,
+    }
+
+
+# ---------------- Núcleo de inversión ----------------
+
+def invert_synth_with_options(
+    data_csv,
+    dh=150., nz=40, z_top=None, pad=0.0, strip_top_layers=0,
+    inv_type="joint",                   # "gravity" | "mag_gradiometry" | "joint"
+    B0=30055.6, inc=26.78927, dec=-7.63654,
+    prefer_bzz=True, alpha_z_chi=5e-3,
+    fixed_slices=None,
+    fixed_density_slices=None,
+    fixed_scalar_slices=None,
+    rho_background=2.5,
+    # SOLO VISUAL:
+    stride_3d=(1,1,1), plot_strip_top_layers=0,
+    # PREVIO opcional:
+    use_prior=False, prior_model_file=None,
+    plot_misfit=True, misfit_output_dir=None, plot_3d=False,
+    misfit_grid_shape=(180, 180)
+):
+    df = pd.read_csv(data_csv)
+    if not {"X","Y","Z"}.issubset(df.columns):
+        raise KeyError(f"{data_csv} debe contener columnas X,Y,Z.")
+    xyz_all = df[["X","Y","Z"]].astype(float).values
+
+    # Señales presentes
+    has_g = "gravedad" in df.columns
+    if has_g: gz_obs = df["gravedad"].astype(float).values
+
+    candidates = ["bzz","byy","bxx","bxy","bxz","byz"]
+    have = [c for c in candidates if c in df.columns]
+    components = ([c for c in ["bzz","byy","bxx"] if c in have] or have) if prefer_bzz else have
+    has_m = len(components) > 0
+    if has_m:
+        M = np.column_stack([df[c].astype(float).values for c in components])
+        dobs_m = M.ravel(order="C")
+
+    # Malla
+    mesh, active, topo_xyz = build_mesh_and_active_flat(
+        xyz_all, dh=dh, nz=nz, z_top=z_top, pad=pad, strip_top_layers=strip_top_layers
+    )
+    nA = int(active.sum()); CC_act = mesh.gridCC[active]
+
+    # Modelos iniciales
+    bg = float(rho_background)
+    m0rho = np.full(nA, bg, dtype=float)
+    m0chi = np.zeros(nA, dtype=float) + 0.01
+
+    # Cargar previo (opcional)
+    if use_prior and prior_model_file and os.path.isfile(prior_model_file):
+        try:
+            dprev = pd.read_csv(prior_model_file)
+            P = dprev[["X","Y","Z"]].astype(float).values
+            ids = cKDTree(P).query(CC_act, k=1)[1]
+            cols_low = [c.strip().lower() for c in dprev.columns]
+            for key in ["densidad","density","rho","dens"]:
+                if key in cols_low:
+                    m0rho = pd.to_numeric(dprev[dprev.columns[cols_low.index(key)]], errors="coerce").values[ids].astype(float)
+                    break
+            for key in ["susceptibilidad","susceptibility","chi","k","kappa"]:
+                if key in cols_low:
+                    m0chi = pd.to_numeric(dprev[dprev.columns[cols_low.index(key)]], errors="coerce").values[ids].astype(float)
+                    break
+        except Exception as e:
+            print("[warn] no se pudo cargar el previo:", e)
+
+    misfit_extent = (
+        float(mesh.nodes_x.min()), float(mesh.nodes_x.max()),
+        float(mesh.nodes_y.min()), float(mesh.nodes_y.max())
+    )
+
+    out = {"mesh": mesh, "active": active, "topo_xyz": topo_xyz,
+           "rho_init": m0rho, "chi_init": m0chi,
+           "rho_rec": None, "chi_rec": None, "xyz_all": xyz_all, "misfit": {}}
+
+    # Cortes para figuras 2D.
+    # fixed_slices se mantiene por compatibilidad; si se definen cortes separados,
+    # densidad y susceptibilidad pueden usar profundidades distintas.
+    density_slices_for_plot = fixed_density_slices if fixed_density_slices is not None else fixed_slices
+    scalar_slices_for_plot = fixed_scalar_slices if fixed_scalar_slices is not None else fixed_slices
+
+    # Errores
+    if has_g:
+        errs_g = np.maximum(1e-3, 0.02*np.abs(gz_obs))
+    if has_m:
+        NOISE_M_FRAC = 0.03
+        abs_cols = [np.abs(df[c].values.astype(float)) for c in components]
+        p90_each = [np.percentile(a, 90) for a in abs_cols]
+        floors   = [0.05*v if v>0 else 1e-9 for v in p90_each]
+        std_cols = [np.maximum(floor_i, NOISE_M_FRAC*a)
+                    for a, floor_i in zip(abs_cols, floors)]
+        std_block = np.column_stack(std_cols).ravel(order="C")
+
+    # Normaliza tipo
+    it = str(inv_type).strip().lower()
+    alias = {"grav":"gravity","gz":"gravity","mag":"mag_gradiometry"}
+    inv_type_l = alias.get(it, it)
+    if inv_type_l not in {"gravity","mag_gradiometry","joint"}:
+        inv_type_l = "joint" if (has_g and has_m) else ("gravity" if has_g else "mag_gradiometry")
+
+    # ---------------- GRAVITY ----------------
+    if inv_type_l == "gravity":
+        if not has_g: raise ValueError("No hay 'gravedad' en el CSV.")
+        wires = maps.Wires(("density", nA))
+        rx_g  = gravity.receivers.Point(xyz_all, components="gz")
+        src_g = gravity.sources.SourceField([rx_g])
+        survey_g = gravity.survey.Survey(src_g)
+        sim_g = gravity.simulation.Simulation3DIntegral(
+            mesh=mesh, rhoMap=wires.density, survey=survey_g,
+            active_cells=active, store_sensitivities="disk"
+        )
+        dobj_g = data.Data(survey_g, dobs=gz_obs, standard_deviation=errs_g)
+        dmis_g = data_misfit.L2DataMisfit(data=dobj_g, simulation=sim_g)
+
+        m_ref   = np.zeros_like(m0rho)   # sin “pull” al previo
+        m_start = np.zeros_like(m0rho)
+
+        reg_g = regularization.WeightedLeastSquares(
+            mesh, active_cells=active, mapping=wires.density,
+            alpha_s=5e-4, alpha_x=5e-4, alpha_y=5e-4, alpha_z=5e-4,
+            reference_model=m_ref
+        )
+        opt = optimization.ProjectedGNCG(maxIter=40, lower=-bg, upper=5.0 - bg)
+        dirs = [
+            directives.UpdateSensitivityWeights(),
+            directives.BetaEstimate_ByEig(beta0_ratio=0.5),
+            # BetaSchedule omitido: UpdateIRLS administra el enfriamiento de beta en SimPEG actual.
+            directives.UpdateIRLS(max_irls_iterations=20, f_min_change=1e-4, cooling_factor=3, cooling_rate=1),
+        ]
+        invp = inverse_problem.BaseInvProblem(dmis_g, reg_g, opt)
+        inv  = inversion.BaseInversion(invp, directiveList=dirs)
+        mrec = inv.run(m_start)
+        rho_rec = mrec + bg
+        out["rho_rec"] = rho_rec
+
+        if plot_misfit:
+            dpred_g = _get_final_dpred(invp, sim_g, mrec, gz_obs.size)  # evita una predicción integral duplicada
+            out["misfit"]["gravity"] = _plot_data_misfit(
+                xyz_all, gz_obs, dpred_g, errs_g,
+                label="Gravedad gz", units="mGal",
+                output_dir=misfit_output_dir, filename="misfit_gravity",
+                map_extent=misfit_extent, grid_shape=misfit_grid_shape
+            )
+
+        # 2D
+        cuts = density_slices_for_plot if (density_slices_for_plot is not None) else _select_auto_slices(mesh, active, rho_rec, bg=rho_background)
+        _ = _plot_density_results(mesh, active, m0rho, rho_rec, topo_xyz, xyz_all, bg_val=rho_background,
+                                  fixed_slices=cuts, slice_source="recovered")
+
+        # 3D (escala desde el previo)
+        vmin_d = float(np.nanmin(m0rho)); vmax_d = float(np.nanmax(m0rho))
+        if not (vmax_d > vmin_d):
+            eps = 1e-9 if vmin_d == 0.0 else 1e-6*abs(vmin_d) + 1e-9
+            vmin_d -= eps; vmax_d += eps
+        if plot_3d:
+            _plot_model_3d(mesh, active, m0rho, rho_rec, "Densidad (g/cc)",
+                                   vmin=vmin_d, vmax=vmax_d, alpha=1.0,
+                                   stride=stride_3d, plot_strip_top_layers=plot_strip_top_layers)
+        return out
+
+    # ---------------- MAG_GRADIOMETRY ----------------
+    if inv_type_l == "mag_gradiometry":
+        if not has_m: raise ValueError("No hay columnas de gradientes magnéticos en el CSV.")
+        receiver_list = [magnetics.receivers.Point(xyz_all, components=components)]
+        source_field  = magnetics.sources.UniformBackgroundField(
+            receiver_list=receiver_list, amplitude=B0, inclination=inc, declination=dec
+        )
+        survey_m = magnetics.survey.Survey(source_field)
+        sim_m = magnetics.simulation.Simulation3DIntegral(
+            mesh=mesh, chiMap=maps.IdentityMap(nP=nA),
+            survey=survey_m, active_cells=active, store_sensitivities="disk"
+        )
+        dobj_m = data.Data(survey_m, dobs=dobs_m, standard_deviation=std_block)
+        dmis_m = data_misfit.L2DataMisfit(data=dobj_m, simulation=sim_m)
+        reg_m  = regularization.WeightedLeastSquares(
+            mesh, active_cells=active, mapping=maps.IdentityMap(nP=nA),
+            alpha_s=1e-3, alpha_x=1e-3, alpha_y=1e-3, alpha_z=float(alpha_z_chi),
+            reference_model=m0chi
+        )
+        lower = np.zeros(nA) + 0.0
+        upper = np.zeros(nA) + 2.0
+        opt = optimization.ProjectedGNCG(maxIter=40, lower=lower, upper=upper)
+        dirs = [
+            directives.UpdateSensitivityWeights(),
+            directives.BetaEstimate_ByEig(beta0_ratio=0.5),
+            # BetaSchedule omitido: UpdateIRLS administra el enfriamiento de beta en SimPEG actual.
+            directives.UpdateIRLS(max_irls_iterations=20, f_min_change=1e-4, cooling_factor=3, cooling_rate=1),
+        ]
+        invp = inverse_problem.BaseInvProblem(dmis_m, reg_m, opt)
+        inv  = inversion.BaseInversion(invp, directiveList=dirs)
+        chi_rec = inv.run(m0chi)
+        out["chi_rec"] = chi_rec
+
+        if plot_misfit:
+            dpred_m = _get_final_dpred(invp, sim_m, chi_rec, dobs_m.size)  # evita una predicción integral duplicada
+            out["misfit"]["mag_gradiometry"] = _plot_magnetic_misfit(
+                xyz_all, components, dobs_m, dpred_m, std_block,
+                output_dir=misfit_output_dir, filename_prefix="misfit_mag_gradiometry",
+                map_extent=misfit_extent, grid_shape=misfit_grid_shape
+            )
+
+        # 2D
+        cuts_chi = scalar_slices_for_plot if (scalar_slices_for_plot is not None) else _select_auto_slices(mesh, active, m0chi, bg=0.0)
+        _ = _plot_scalar_results(mesh, active, m0chi, chi_rec, label="Susceptibilidad (SI)",
+                                 fixed_slices=cuts_chi, bg=0.0, slice_source="recovered")
+
+        # 3D (escala desde el previo)
+        vmin_k = float(np.nanmin(m0chi)); vmax_k = float(np.nanmax(m0chi))
+        if not (vmax_k > vmin_k):
+            eps = 1e-9 if vmin_k == 0.0 else 1e-6*abs(vmin_k) + 1e-9
+            vmin_k -= eps; vmax_k += eps
+        if plot_3d:
+            _plot_model_3d(mesh, active, m0chi, chi_rec, "Susceptibilidad (SI)",
+                                   vmin=vmin_k, vmax=vmax_k, alpha=1.0,
+                                   stride=stride_3d, plot_strip_top_layers=plot_strip_top_layers)
+        return out
+
+    # ---------------- JOINT ----------------
+    if not (has_g and has_m):
+        raise ValueError("Para 'joint' se requieren 'gravedad' y gradientes magnéticos.")
+
+    wires = maps.Wires(("density", nA), ("chi", nA))
+
+    # Gravity
+    rx_g   = gravity.receivers.Point(xyz_all, components="gz")
+    src_g  = gravity.sources.SourceField([rx_g])
+    survey_g = gravity.survey.Survey(src_g)
+    sim_g  = gravity.simulation.Simulation3DIntegral(
+        mesh=mesh, rhoMap=wires.density, survey=survey_g,
+        active_cells=active, store_sensitivities="disk"
+    )
+    dobj_g = data.Data(survey_g, dobs=gz_obs, standard_deviation=errs_g)
+    dmis_g = data_misfit.L2DataMisfit(data=dobj_g, simulation=sim_g)
+
+    # Magnetics
+    receiver_list = [magnetics.receivers.Point(xyz_all, components=components)]
+    source_field  = magnetics.sources.UniformBackgroundField(
+        receiver_list=receiver_list, amplitude=B0, inclination=inc, declination=dec
+    )
+    survey_m = magnetics.survey.Survey(source_field)
+    sim_m  = magnetics.simulation.Simulation3DIntegral(
+        mesh=mesh, chiMap=wires.chi, survey=survey_m,
+        active_cells=active, store_sensitivities="disk"
+    )
+    dobj_m = data.Data(survey_m, dobs=dobs_m, standard_deviation=std_block)
+    dmis_m = data_misfit.L2DataMisfit(data=dobj_m, simulation=sim_m)
+
+    dmis = dmis_g + dmis_m
+
+    mref_joint   = np.r_[np.zeros_like(m0rho), m0chi*0.0]  # sin pull
+    mstart_joint = np.r_[np.zeros_like(m0rho - bg), np.zeros_like(m0chi)]
+
+    reg_rho = regularization.WeightedLeastSquares(
+        mesh, active_cells=active, mapping=wires.density,
+        alpha_s=5e-4, alpha_x=5e-4, alpha_y=5e-4, alpha_z=5e-4,
+        reference_model=mref_joint
+    )
+    reg_chi = regularization.WeightedLeastSquares(
+        mesh, active_cells=active, mapping=wires.chi,
+        alpha_s=1e-3, alpha_x=1e-3, alpha_y=1e-3, alpha_z=float(alpha_z_chi),
+        reference_model=mref_joint
+    )
+    reg = reg_rho + reg_chi
+
+    lower = np.r_[np.zeros(nA) - bg, np.zeros(nA) + 0.0]
+    upper = np.r_[np.zeros(nA) + 5.0 - bg, np.zeros(nA) + 2.0]
+    opt = optimization.ProjectedGNCG(maxIter=40, lower=lower, upper=upper)
+    dirs = [
+        directives.UpdateSensitivityWeights(),
+        directives.BetaEstimate_ByEig(beta0_ratio=0.5),
+        # BetaSchedule omitido: UpdateIRLS administra el enfriamiento de beta en SimPEG actual.
+        directives.UpdateIRLS(max_irls_iterations=20, f_min_change=1e-4, cooling_factor=3, cooling_rate=1),
+    ]
+    invp = inverse_problem.BaseInvProblem(dmis, reg, opt)
+    inv  = inversion.BaseInversion(invp, directiveList=dirs)
+
+    mrec_joint = inv.run(mstart_joint)
+    wires_out = maps.Wires(("density", nA), ("chi", nA))
+    rho_rec = (wires_out.density * mrec_joint) + bg
+    chi_rec = (wires_out.chi * mrec_joint)
+    out["rho_rec"] = rho_rec; out["chi_rec"] = chi_rec
+
+    if plot_misfit:
+        dpred_g, dpred_m = _get_joint_final_dpred(
+            invp, [sim_g, sim_m], mrec_joint, [gz_obs.size, dobs_m.size]
+        )  # evita predicciones integrales duplicadas
+        out["misfit"]["gravity"] = _plot_data_misfit(
+            xyz_all, gz_obs, dpred_g, errs_g,
+            label="Gravedad gz - inversión conjunta", units="mGal",
+            output_dir=misfit_output_dir, filename="misfit_joint_gravity",
+                map_extent=misfit_extent, grid_shape=misfit_grid_shape
+        )
+        out["misfit"]["mag_gradiometry"] = _plot_magnetic_misfit(
+            xyz_all, components, dobs_m, dpred_m, std_block,
+            output_dir=misfit_output_dir, filename_prefix="misfit_joint_mag_gradiometry",
+                map_extent=misfit_extent, grid_shape=misfit_grid_shape
+        )
+        out["misfit"]["phi_d_total"] = (
+            out["misfit"]["gravity"]["metrics"]["phi_d"]
+            + out["misfit"]["mag_gradiometry"]["phi_d_total"]
+        )
+        print(f"[misfit] phi_d total conjunto = {out['misfit']['phi_d_total']:.2f}")
+
+    # 2D
+    cuts_rho = density_slices_for_plot if (density_slices_for_plot is not None) else _select_auto_slices(mesh, active, m0rho, bg=rho_background)
+    _ = _plot_density_results(mesh, active, m0rho, rho_rec, topo_xyz, xyz_all, bg_val=rho_background,
+                              fixed_slices=cuts_rho, slice_source="recovered")
+    cuts_chi = scalar_slices_for_plot if (scalar_slices_for_plot is not None) else _select_auto_slices(mesh, active, m0chi, bg=0.0)
+    _ = _plot_scalar_results(mesh, active, m0chi, chi_rec, label="Susceptibilidad (SI)",
+                             fixed_slices=cuts_chi, bg=0.0, slice_source="recovered")
+
+    # 3D (escala desde los previos)
+    vmin_d = float(np.nanmin(m0rho)); vmax_d = float(np.nanmax(m0rho))
+    if not (vmax_d > vmin_d):
+        eps = 1e-9 if vmin_d == 0.0 else 1e-6*abs(vmin_d) + 1e-9
+        vmin_d -= eps; vmax_d += eps
+    if plot_3d:
+        _plot_model_3d(mesh, active, m0rho, rho_rec, "Densidad (g/cc)",
+                           vmin=vmin_d, vmax=vmax_d, alpha=1.0,
+                           stride=stride_3d, plot_strip_top_layers=plot_strip_top_layers)
+
+    vmin_k = float(np.nanmin(m0chi)); vmax_k = float(np.nanmax(m0chi))
+    if not (vmax_k > vmin_k):
+        eps = 1e-9 if vmin_k == 0.0 else 1e-6*abs(vmin_k) + 1e-9
+        vmin_k -= eps; vmax_k += eps
+    if plot_3d:
+        _plot_model_3d(mesh, active, m0chi, chi_rec, "Susceptibilidad (SI)",
+                           vmin=vmin_k, vmax=vmax_k, alpha=1.0,
+                           stride=stride_3d, plot_strip_top_layers=plot_strip_top_layers)
+    return out
+
+# =========================
+# CONFIGURACIÓN (SINTÉTICOS)
+# =========================
+BASE = "/content/drive/MyDrive/Tesis"
+SYN_DIR = os.path.join(BASE, "Sinteticos")
+
+# Escenario y datos
+ESCENARIO = "multicuerpos"   # "esquematico" | "denso_profundo" | "liviano" | "multicuerpos" | "falla_normal"
+DATA_SYN  = os.path.join(SYN_DIR, ESCENARIO, "datos_sinteticos_anom.csv")
+
+# Malla
+DH   = 150.0
+NZ   = 40
+ZTOP = None   # auto = max(Z estaciones) + 0.5*DH
+PAD  = 0.0
+
+# Campo magnético (si usas magnetics)
+B0, INC, DEC = 30055.6, 26.78927, -7.63654
+
+# Cortes fijos para figuras 2D.
+# Se usan cortes separados porque las figuras históricas de densidad y susceptibilidad
+# en la tesis se hicieron con profundidades/ejes distintos.
+USE_FIXED_DENSITY_CUTS = True
+DENSITY_Z_CUT = -300.0
+DENSITY_Y_CUT = None       # None = mediana de Y de los datos
+
+USE_FIXED_CHI_CUTS = True
+CHI_Z_CUT = -450.0
+CHI_Y_CUT = 1575.0
+
+FIXED_DENSITY_SLICES = None
+FIXED_CHI_SLICES = None
+
+if USE_FIXED_DENSITY_CUTS or USE_FIXED_CHI_CUTS:
+    df_tmp = pd.read_csv(DATA_SYN)
+
+if USE_FIXED_DENSITY_CUTS:
+    Y_DENS = float(df_tmp["Y"].median()) if (DENSITY_Y_CUT is None) else float(DENSITY_Y_CUT)
+    FIXED_DENSITY_SLICES = (float(DENSITY_Z_CUT), Y_DENS, None, None)
+
+if USE_FIXED_CHI_CUTS:
+    Y_CHI = float(df_tmp["Y"].median()) if (CHI_Y_CUT is None) else float(CHI_Y_CUT)
+    FIXED_CHI_SLICES = (float(CHI_Z_CUT), Y_CHI, None, None)
+
+# Compatibilidad con versiones anteriores.
+# Si solo quieres usar un mismo corte para todo, puedes pasar fixed_slices=FIXED_SLICES.
+FIXED_SLICES = None
+
+# Modelo previo (opcional)
+USE_PRIOR = True
+PRIOR_MODEL = os.path.join(SYN_DIR, ESCENARIO, "modelo_mesh.csv")
+
+# Visual
+STRIDE_3D = (1,1,1)
+PLOT_STRIP_TOP = 1   # “pela” solo en el plot 1 capa; 0 = no pelar
+PLOT_MISFIT = True
+PLOT_3D = False  # El voxel 3D es pesado; actívalo solo para una figura final.
+MISFIT_OUTPUT_DIR = os.path.join(SYN_DIR, ESCENARIO, "figuras_misfit")
+
+print("ESCENARIO:", ESCENARIO)
+print("CSV     :", DATA_SYN)
+
+# Ejecuta una sola inversión por corrida para controlar tiempo y memoria.
+RUN_GRAVITY = True
+RUN_MAG_GRADIOMETRY = False
+RUN_JOINT = False
+
+if RUN_GRAVITY:
+    # ---------- Ejecutar: GRAVITY ----------
+    res_syn_grav = invert_synth_with_options(
+        data_csv=DATA_SYN, dh=DH, nz=NZ, z_top=ZTOP, pad=PAD,
+        inv_type="gravity",
+        fixed_slices=FIXED_SLICES,
+        fixed_density_slices=FIXED_DENSITY_SLICES,
+        fixed_scalar_slices=FIXED_CHI_SLICES,
+        strip_top_layers=0,                 # no recortes en inversión
+        stride_3d=STRIDE_3D, plot_strip_top_layers=PLOT_STRIP_TOP,
+        use_prior=USE_PRIOR, prior_model_file=(PRIOR_MODEL if USE_PRIOR else None),
+        plot_misfit=PLOT_MISFIT, misfit_output_dir=MISFIT_OUTPUT_DIR, plot_3d=PLOT_3D
+    )
+
+if RUN_MAG_GRADIOMETRY:
+    # ---------- Ejecutar: MAG_GRADIOMETRY ----------
+    res_syn_mag = invert_synth_with_options(
+        data_csv=DATA_SYN, dh=DH, nz=NZ, z_top=ZTOP, pad=PAD,
+        inv_type="mag_gradiometry",
+        B0=B0, inc=INC, dec=DEC,
+        fixed_slices=FIXED_SLICES,
+        fixed_density_slices=FIXED_DENSITY_SLICES,
+        fixed_scalar_slices=FIXED_CHI_SLICES,
+        strip_top_layers=0,
+        stride_3d=STRIDE_3D, plot_strip_top_layers=PLOT_STRIP_TOP,
+        use_prior=USE_PRIOR, prior_model_file=(PRIOR_MODEL if USE_PRIOR else None),
+        plot_misfit=PLOT_MISFIT, misfit_output_dir=MISFIT_OUTPUT_DIR, plot_3d=PLOT_3D
+    )
+
+if RUN_JOINT:
+    # ---------- Ejecutar: JOINT ----------
+    res_syn_joint = invert_synth_with_options(
+        data_csv=DATA_SYN, dh=DH, nz=NZ, z_top=ZTOP, pad=PAD,
+        inv_type="joint",
+        B0=B0, inc=INC, dec=DEC,
+        fixed_slices=FIXED_SLICES,
+        fixed_density_slices=FIXED_DENSITY_SLICES,
+        fixed_scalar_slices=FIXED_CHI_SLICES,
+        strip_top_layers=0,
+        stride_3d=STRIDE_3D, plot_strip_top_layers=PLOT_STRIP_TOP,
+        use_prior=USE_PRIOR, prior_model_file=(PRIOR_MODEL if USE_PRIOR else None),
+        plot_misfit=PLOT_MISFIT, misfit_output_dir=MISFIT_OUTPUT_DIR, plot_3d=PLOT_3D
+    )
