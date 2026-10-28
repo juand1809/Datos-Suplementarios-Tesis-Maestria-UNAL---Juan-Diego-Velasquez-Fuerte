@@ -1,0 +1,15 @@
+# Direct Python dependencies identified from the archived inversion scripts.
+# Only SimPEG is version-pinned: v0.24.0 is reported in the manuscript.
+# This is an initial installation list, NOT a lockfile from the original runs.
+# Python >=3.10 is required by SimPEG 0.24.0.
+simpeg==0.24.0
+discretize
+numpy
+scipy
+pandas
+matplotlib
+geopandas
+rasterio
+pyproj
+shapely
+openpyxl  # Excel .xlsx reader used by pandas.read_excel

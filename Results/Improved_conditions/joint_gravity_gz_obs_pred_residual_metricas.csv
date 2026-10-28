@@ -1,0 +1,2 @@
+label,units,n_data,rmse,mae,bias_obs_minus_pred,rms_normalized,phi_d
+Gravimetría gz,mGal,400,1.3885793798542518,0.9909417301854936,0.5174676019987683,0.45220503060844636,40.89787794151718

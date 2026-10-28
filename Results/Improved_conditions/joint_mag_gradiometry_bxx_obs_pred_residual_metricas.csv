@@ -1,0 +1,2 @@
+label,units,n_data,rmse,mae,bias_obs_minus_pred,rms_normalized,phi_d
+Gradiometría bxx,nT/m,400,1405.4651596207552,1122.4619639982284,526.8131939639151,0.44357073169486216,39.350998803263074
